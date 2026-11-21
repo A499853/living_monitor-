@@ -22,3 +22,5 @@ __pycache__/
 /*.exe
 /*.dll
 
+# git init -b main
+# git add .

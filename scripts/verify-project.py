@@ -169,9 +169,15 @@ class RestorationChecks(unittest.TestCase):
         self.assertEqual(backend.request("PUT", "/api/settings", {"monitor_batch_size": 2},
                                          {"X-LiveWatch-Token": "invalid"})[0], 403)
         self.assertEqual(backend.json("GET", "/api/state")["rooms"], [])
-        settings = {"monitor_batch_size": 3, "monitor_interval_minutes": 1.5,
+        settings = {"monitor_batch_size": 16, "monitor_interval_minutes": 1.5,
+                    "monitor_schedule_mode": "batch", "monitor_douyin_concurrency": 2,
+                    "monitor_process_isolation": True,
                     "room_check_delay_seconds": 2, "ffmpeg_path": str(FFMPEG)}
         backend.json("PUT", "/api/settings", settings)
+        for invalid in ({"monitor_batch_size": 17}, {"monitor_batch_size": True},
+                        {"monitor_douyin_concurrency": 6}, {"monitor_douyin_concurrency": 0},
+                        {"monitor_process_isolation": 1}, {"monitor_schedule_mode": "invalid"}):
+            self.assertEqual(backend.request("PUT", "/api/settings", invalid)[0], 400)
         room = {"platform": "douyin", "room_input": "restore_smoke_20261121",
                 "nickname": "离线恢复测试", "monitor_enabled": False,
                 "record_enabled": False, "remark": "created"}
@@ -200,6 +206,61 @@ class RestorationChecks(unittest.TestCase):
         backend.json("DELETE", "/api/rooms/" + room_id, {})
         self.assertEqual(backend.json("GET", "/api/state")["rooms"], [])
         self.assertEqual(backend.stop(), 0)
+
+    def test_backend_process_probes_and_live_settings(self):
+        # Exercise the actual API -> Engine -> child ProviderRegistry path,
+        # including switching off isolation without restarting the backend.
+        fixture = self.root / "status.json"
+        fixture.write_text(json.dumps({"live": False, "nickname": "子进程监控"}), "utf-8")
+        handler = functools.partial(QuietMediaHandler, directory=str(self.root))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        backend = Backend(self.root / "isolated-state")
+        try:
+            backend.start()
+            backend.json("PUT", "/api/settings", {
+                "monitor_schedule_mode": "independent", "monitor_batch_size": 3,
+                "monitor_process_isolation": True, "room_check_delay_seconds": 0,
+                "sound_enabled": False,
+            })
+            for number in range(3):
+                backend.json("POST", "/api/rooms", {
+                    "platform": "wechat", "room_input": f"local-process-{number}",
+                    "record_enabled": False,
+                    "status_url": f"http://127.0.0.1:{server.server_port}/status.json",
+                }, expected=201)
+
+            def await_state(predicate):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    state = backend.json("GET", "/api/state")
+                    if predicate(state):
+                        return state
+                    time.sleep(.02)
+                self.fail("Backend probes did not reach the expected state")
+
+            state = await_state(lambda state: all(room["live_status"] == "waiting"
+                                                  for room in state["rooms"]))
+            self.assertEqual(len(state["rooms"]), 3)
+            self.assertTrue(all(room["nickname"] == "子进程监控" for room in state["rooms"]))
+            self.assertTrue(1 <= state["monitor"]["active_processes"] <= 3)
+            backend.json("PUT", "/api/settings", {"monitor_process_isolation": False})
+            await_state(lambda state: state["monitor"]["active_processes"] == 0)
+            fixture.write_text(json.dumps({"live": True, "nickname": "线程监控"}), "utf-8")
+            backend.json("POST", "/api/refresh", {})
+            state = await_state(lambda state: all(room["live_status"] == "live" and
+                                                  room["nickname"] == "线程监控"
+                                                  for room in state["rooms"]))
+            self.assertEqual(state["monitor"]["active_processes"], 0)
+            self.assertFalse(state["monitor"]["process_isolation"])
+            self.assertEqual(backend.stop(), 0)
+        finally:
+            backend.stop()
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
 
     def test_local_media_recording_and_playback(self):
         from livewatch.playback import Playback

@@ -1,0 +1,6 @@
+# Store text as LF and use LF in working copies on every platform.
+* text=auto eol=lf
+
+# Windows command scripts require CRLF for consistent cmd.exe behavior.
+*.bat text eol=crlf
+*.cmd text eol=crlf

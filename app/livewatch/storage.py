@@ -18,7 +18,7 @@ def room_directory(room):
 class Store:
     FIELDS = {'platform','room_input','nickname','monitor_enabled','record_enabled','remark','stream_url','status_url','request_headers','input_type','transfer_options'}
     # poll_interval is retained only to read older settings; monitoring uses rounds.
-    DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':1,'room_check_delay_seconds':1,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'douyin_access_mode':'anonymous'}
+    DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'douyin_access_mode':'anonymous'}
     def __init__(self, root):
         self.root = Path(root).resolve()
         for name in ['data','logs','video','time_begin_over']:
@@ -181,15 +181,20 @@ class Store:
     def update_settings(self,payload):
         if not isinstance(payload,dict) or set(payload)-set(self.DEFAULTS): raise ValueError('无效的设置字段')
         value=dict(payload)
-        for key,lo,hi,label in [('monitor_interval_minutes',0.1,1440,'整轮检查间隔（分钟）'),('room_check_delay_seconds',0,60,'批次间停顿（秒）'),('min_free_disk_gib',0,1048576,'磁盘最小剩余空间（GiB）')]:
+        for key,lo,hi,label in [('monitor_interval_minutes',0.1,1440,'整轮检查间隔（分钟）'),('room_check_delay_seconds',0,60,'派发间隔 / 批次停顿（秒）'),('min_free_disk_gib',0,1048576,'磁盘最小剩余空间（GiB）')]:
             if key in value:
                 number=value[key]
                 if isinstance(number,bool) or not isinstance(number,(int,float)) or not math.isfinite(number) or not lo<=number<=hi:
                     raise ValueError(f'{label}必须为 {lo}～{hi} 之间的数值')
-        if 'monitor_batch_size' in value:
-            batch_size=value['monitor_batch_size']
-            if isinstance(batch_size,bool) or not isinstance(batch_size,int) or not 1<=batch_size<=5:
-                raise ValueError('每批检测数量必须为 1～5 之间的整数')
+        for key,maximum,label in [('monitor_batch_size',16,'检查并发上限'),('monitor_douyin_concurrency',5,'抖音官方检查并发上限')]:
+            if key in value:
+                count=value[key]
+                if isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=maximum:
+                    raise ValueError(f'{label}必须为 1～{maximum} 之间的整数')
+        if 'monitor_schedule_mode' in value and value['monitor_schedule_mode'] not in ('independent','batch'):
+            raise ValueError('监控调度方式必须为 independent 或 batch')
+        if 'monitor_process_isolation' in value and not isinstance(value['monitor_process_isolation'],bool):
+            raise ValueError('监控进程隔离设置必须为布尔值')
         for key,label in [('recording_retention_days','录制保留天数'),('log_retention_days','日志保留天数')]:
             if key in value and (isinstance(value[key],bool) or not isinstance(value[key],int) or not 0<=value[key]<=3650):
                 raise ValueError(label+'必须为 0～3650 之间的整数（0 表示关闭自动清理）')
