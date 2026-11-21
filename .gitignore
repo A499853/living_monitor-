@@ -1,0 +1,24 @@
+# User data and runtime output
+/data/
+/logs/
+/video/
+/time_begin_over/
+/app/data/
+/app/logs/
+/app/video/
+/app/time_begin_over/
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated build output and locally downloaded development tools
+/.build-tools/
+/build/
+/artifacts/
+
+# Distributions and third-party binary runtimes
+/release/
+/tools/
+/*.exe
+/*.dll
+
