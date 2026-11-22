@@ -992,7 +992,9 @@ def _douyin_input(value, input_type='auto'):
     return 'page', url
 
 class ProviderRegistry:
-    requires_auth = True
+    # Public room/status endpoints do not need the phone's account session.
+    # Sources which really require authorization report it at their own boundary.
+    requires_auth = False
     adaptive_polling = True
     offline_confirmations = 2
     def __init__(self):
@@ -1009,7 +1011,7 @@ class ProviderRegistry:
 
     @staticmethod
     def _credential_fingerprint(settings):
-        credential = str(settings.get('douyin_cookie', '')) + '\0' + str(settings.get('douyin_user_agent', USER_AGENT)) + '\0' + str(settings.get('douyin_access_mode', 'anonymous'))
+        credential = str(settings.get('douyin_cookie', '')) + '\0' + str(settings.get('douyin_user_agent', USER_AGENT)) + '\0' + str(settings.get('douyin_access_mode', 'anonymous')) + '\0' + str(settings.get('monitor_identity_isolation', True))
         return hashlib.sha256(credential.encode('utf-8')).digest()
 
     def _clear_auth_locked(self):
@@ -1066,8 +1068,10 @@ class ProviderRegistry:
                 raise ProbeError('不支持的平台。')
             headers = validate_headers(room.get('request_headers') or {})
             if room.get('status_url'):
-                return self._status(room, headers)
+                return self._status(room, headers, status_only=bool(settings.get('_status_only', False)))
             if room.get('stream_url'):
+                if settings.get('_status_only') and not room.get('record_enabled'):
+                    raise ProbeError('仅有直播源无法可靠确认下播。高频状态监控请配置状态接口，或关闭高频状态模式使用媒体探测。', 'status_source_required', 300)
                 return self._stream(room, headers)
             if platform == 'douyin':
                 generation = self._auth_state(settings)
@@ -1086,7 +1090,7 @@ class ProviderRegistry:
         except (TypeError, ValueError, KeyError, RecursionError, UnicodeError):
             return ProbeResult(None, message='平台数据格式发生变化，暂不能确认直播状态。')
 
-    def _status(self, room, headers):
+    def _status(self, room, headers, status_only=False):
         request_headers = _source_headers(room['status_url'], headers)
         body, _, _ = _request(room['status_url'], request_headers, opener=_anonymous_opener() if _douyin_target(room['status_url']) else None)
         data = _json(body)
@@ -1107,6 +1111,11 @@ class ProviderRegistry:
         metadata = dict(live_started_at=started, live_session_id=session_id, avatar_url=avatar, started_at_source=time_source)
         if not data['live']:
             return ProbeResult(False, nickname=name[:200], **metadata)
+        if status_only and not room.get('record_enabled'):
+            # State consumers never need to inspect media URLs or credentials.
+            # A malformed/expired optional stream cannot invalidate a clear
+            # boolean status; recording probes retain the existing media data.
+            return ProbeResult(True, nickname=name[:200], **metadata)
         url = room.get('stream_url') or data.get('stream_url') or ''
         if url:
             url = validate_url(url)
@@ -1322,26 +1331,38 @@ class ProviderRegistry:
         if not isinstance(raw, str) or not raw.strip():
             raise ProbeError('请输入抖音直播间链接或数字房间号。')
         kind, identifier = _douyin_input(raw, room.get('input_type', 'auto'))
+        status_only = bool(settings.get('_status_only', False))
+        isolate_identity = settings.get('monitor_identity_isolation', True) is not False
         share_user = None
         if kind == 'page':
-            kind, identifier, share_user = self._resolve_share_url(identifier)
+            if status_only:
+                target = _share_target(identifier)
+                if target is None:
+                    raise ProbeError('高频状态监控需要固定直播间链接（live.douyin.com/房间号）或状态接口；请先把短分享链接替换为直播间链接。', 'status_source_required', 300)
+                kind, identifier, share_user = target
+            else:
+                kind, identifier, share_user = self._resolve_share_url(identifier)
         # A shared session is one broadcast, not a permanent browser room id.
         # With authorization, follow only its verified owner through the exact
         # current profile so later broadcasts of that same anchor are found.
-        if kind == 'session' and settings.get('douyin_cookie') and share_user:
+        if kind == 'session' and not status_only and not isolate_identity and settings.get('douyin_cookie') and share_user:
             kind, identifier = 'profile', share_user['sec_uid']
+        if status_only and kind != 'room':
+            raise ProbeError('高频状态监控需要可跨场次复用的房间地址，不轮询账号资料或旧场次。请使用固定直播间链接（live.douyin.com/房间号）或状态接口。', 'status_source_required', 300)
         access = settings.get('douyin_access_mode', 'anonymous')
         if access not in ('anonymous', 'authorized'):
             raise ProbeError('监控访问方式无效，请在设置中重新选择。')
         # Account resolution, anonymous monitoring and opted-in room monitoring
         # use distinct openers. Recording/CDN headers always remain anonymous.
+        # Isolation also covers account lookup: even profile/search requests
+        # must not reuse the account session currently watched on the phone.
         request_headers = validate_headers(_anonymous_headers({'User-Agent': USER_AGENT, 'Referer': 'https://live.douyin.com/', 'Accept-Language': 'zh-CN,zh;q=0.9'} | headers))
         request_headers['User-Agent'] = USER_AGENT
         self._local.user_agent = USER_AGENT
         opener = getattr(self._local, 'anonymous_opener', None)
         if opener is None:
             opener = self._local.anonymous_opener = _anonymous_opener()
-        if access == 'authorized':
+        if access == 'authorized' and not isolate_identity:
             try:
                 cookie = authorized_monitor_cookie(settings.get('douyin_cookie', ''))
             except ValueError as exc:
@@ -1360,16 +1381,22 @@ class ProviderRegistry:
         expected_sec_uid = ''
         if kind in ('account', 'profile'):
             cookie = settings.get('douyin_cookie', '')
-            if not cookie:
+            if not isolate_identity and not cookie:
                 raise ProbeError('按抖音账号查询需要先在软件的独立窗口登录抖音。', 'auth_required', 300)
-            account_headers = {'User-Agent': settings.get('douyin_user_agent') or USER_AGENT, 'Referer': 'https://www.douyin.com/', 'Cookie': cookie}
-            account_opener = getattr(self._local, 'account_opener', None)
-            if account_opener is None:
-                account_opener = self._local.account_opener = _opener(account_lookup=True)
+            if isolate_identity:
+                account_headers = {'User-Agent': USER_AGENT, 'Referer': 'https://www.douyin.com/'}
+                account_opener = opener
+            else:
+                account_headers = {'User-Agent': settings.get('douyin_user_agent') or USER_AGENT, 'Referer': 'https://www.douyin.com/', 'Cookie': cookie}
+                account_opener = getattr(self._local, 'account_opener', None)
+                if account_opener is None:
+                    account_opener = self._local.account_opener = _opener(account_lookup=True)
             try:
                 kind, identifier, user = self._resolve_account(kind, identifier, account_headers, account_opener)
             except ProbeError as exc:
                 diagnostic = sanitize_probe_diagnostic(exc.diagnostic + ' stage=account_lookup')
+                if isolate_identity and exc.code in ('auth_required', 'verification_required'):
+                    raise ProbeError('匿名账号查询受到限制；请改用固定直播间链接，身份隔离模式不会使用手机账号登录资料。', 'anonymous_restricted', max(120, exc.retry_after), diagnostic) from None
                 if exc.code == 'rate_limited':
                     raise ProbeError('账号资料查询频率受限，稍后重试。', 'account_rate_limited', exc.retry_after, diagnostic) from None
                 raise ProbeError(str(exc), exc.code, exc.retry_after, diagnostic) from None
@@ -1384,20 +1411,29 @@ class ProviderRegistry:
                     if exc.code == 'auth_required':
                         raise ProbeError(anonymous_error_message('anonymous_restricted', diagnostic), 'anonymous_restricted', max(120, exc.retry_after), diagnostic) from None
                     raise ProbeError(str(exc), exc.code, exc.retry_after, diagnostic) from None
+        monitor_access = 'anonymous' if isolate_identity else access
+        monitor_opener = getattr(self._local, 'anonymous_opener', None) if isolate_identity else opener
+        if monitor_opener is None:
+            monitor_opener = self._local.anonymous_opener = _anonymous_opener()
+        if isolate_identity:
+            request_headers['User-Agent'] = USER_AGENT
         try:
-            result = self._douyin_anonymous(kind, identifier, expected_sec_uid, request_headers, opener, access)
+            result = self._douyin_anonymous(kind, identifier, expected_sec_uid, request_headers, monitor_opener, monitor_access,
+                                             status_only=status_only)
             if result.live is None and result.error_code == 'platform_unavailable' and room.get('input_type', 'auto') == 'auto' and not raw.strip().startswith(('@', 'http://', 'https://')):
                 result.message += ' 若填写的是抖音账号，请选择“抖音账号”或在 ID 前加 @。'
             return result
         except ProbeError as exc:
-            diagnostic = sanitize_probe_diagnostic(exc.diagnostic + ' stage=room_page' + (' access=authorized' if access == 'authorized' else ''))
-            if access == 'authorized':
-                return _monitor_result(ProbeResult(None, message=str(exc), error_code=exc.code, retry_after=exc.retry_after, diagnostic=diagnostic), access)
+            diagnostic = sanitize_probe_diagnostic(exc.diagnostic + ' stage=room_page' + (' access=authorized' if monitor_access == 'authorized' else ''))
+            if monitor_access == 'authorized':
+                return _monitor_result(ProbeResult(None, message=str(exc), error_code=exc.code, retry_after=exc.retry_after, diagnostic=diagnostic), monitor_access)
             if exc.code == 'auth_required':
                 raise ProbeError(anonymous_error_message('anonymous_restricted', diagnostic), 'anonymous_restricted', max(120, exc.retry_after), diagnostic) from None
             raise ProbeError(str(exc), exc.code, exc.retry_after, diagnostic) from None
 
-    def _douyin_anonymous(self, kind, identifier, expected_sec_uid, request_headers, opener, access='anonymous'):
+    def _douyin_anonymous(self, kind, identifier, expected_sec_uid, request_headers, opener, access='anonymous', status_only=False):
+        if status_only and kind != 'room':
+            raise ProbeError('高频状态监控需要固定直播间地址或状态接口。', 'status_source_required', 300)
         page = None
         page_facts = ''
         page_failure = ''
@@ -1432,7 +1468,10 @@ class ProviderRegistry:
         # Reuse an anonymous transport per worker. Bootstrap once, then bound
         # subsequent large-page refreshes independently for each room.
         bootstrap_attempted = False
-        if not getattr(self._local, 'bootstrapped', False):
+        # A high-frequency status wave should call only the compact room-enter
+        # endpoint. Full room HTML is useful metadata/fallback, but it is slow
+        # and can trigger verification on a weak connection.
+        if not status_only and not getattr(self._local, 'bootstrapped', False):
             bootstrap_attempted = True
             self._local.last_bootstrap = time.monotonic()
             try:
@@ -1469,7 +1508,7 @@ class ProviderRegistry:
             if result.live is not None:
                 result.headers = request_headers
                 result.resolved_room_input = 'https://live.douyin.com/' + identifier
-                return self._enrich_douyin(result)
+                return result if status_only else self._enrich_douyin(result)
             api_error = result.message
             api_error_code, api_retry_after = result.error_code, result.retry_after
             api_diagnostic = result.diagnostic
@@ -1477,6 +1516,14 @@ class ProviderRegistry:
             api_error = str(exc)
             api_error_code, api_retry_after = exc.code, exc.retry_after
             api_diagnostic = sanitize_probe_diagnostic(exc.diagnostic + ' stage=room_web_enter ' + api_body_facts + (' access=authorized' if access == 'authorized' else ''))
+        if status_only:
+            # Do not spend the rest of a short status deadline on a second
+            # full-page request. Engine retains the last confirmed state and
+            # retries this compact endpoint in the next bounded wave.
+            return _monitor_result(ProbeResult(None,
+                message=api_error or '抖音状态接口暂未确认直播状态，稍后自动重试。',
+                error_code=api_error_code or 'platform_unavailable',
+                retry_after=max(api_retry_after, 5), diagnostic=api_diagnostic), access)
         now = time.monotonic()
         with self._metadata_lock:
             current_generation = generation == self._auth_generation

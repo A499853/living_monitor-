@@ -152,18 +152,26 @@ class _WorkerProcess:
 
 
 class ProbePool:
-    """ThreadPoolExecutor-compatible probe submission with process isolation."""
+    """Executor-compatible probes backed by a shared, bounded process pool.
+
+    Processes belong to the pool, not to executor threads: a later scheduling
+    wave may use different threads while reusing the same idle children.
+    """
 
     def __init__(self, provider, max_workers=16):
         self.provider = provider
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix='probe')
-        self._local = threading.local()
+        self._max_workers = max_workers
+        self._worker_limit = max_workers
         self._lock = threading.RLock()
+        self._available = threading.Condition(self._lock)
         self._workers = set()
         self._busy_workers = set()
         self._retiring_workers = set()
         self._retire_threads = set()
+        self._creating = 0
+        self._restart_credits = 0
         self._isolation_enabled = True
         self._closed = threading.Event()
         self._process_restarts = 0
@@ -175,16 +183,66 @@ class ProbePool:
                 raise RuntimeError('cannot schedule new futures after shutdown')
             return self._executor.submit(self._run, function, dict(room), dict(settings))
 
+    def _acquire_worker(self, deadline):
+        while True:
+            with self._available:
+                if self._closed.is_set() or not self._isolation_enabled:
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                idle = self._workers - self._busy_workers - self._retiring_workers
+                invalid = {worker for worker in idle
+                           if worker._closed.is_set() or worker.process.poll() is not None}
+                self._start_retirement_locked(invalid)
+                idle -= invalid
+                # A reduced limit applies to every future lease immediately.
+                # Already-running requests retain their deadline and drain.
+                if len(self._busy_workers) + self._creating < self._worker_limit:
+                    if idle:
+                        worker = next(iter(idle))
+                        self._busy_workers.add(worker)
+                        return worker
+                    # Retiring children retain their slot until OS termination
+                    # and pipe cleanup finish, including disable/re-enable races.
+                    if len(self._workers) + self._creating < self._worker_limit:
+                        self._creating += 1
+                        break
+                self._available.wait(timeout=remaining)
+        try:
+            worker = _WorkerProcess()
+        except BaseException:
+            with self._available:
+                self._creating -= 1
+                self._available.notify_all()
+            raise
+        with self._available:
+            self._creating -= 1
+            self._workers.add(worker)
+            if self._restart_credits:
+                self._restart_credits -= 1
+                self._process_restarts += 1
+            accepted = (not self._closed.is_set() and self._isolation_enabled
+                        and len(self._workers - self._retiring_workers) <= self._worker_limit
+                        and len(self._busy_workers) < self._worker_limit)
+            if accepted:
+                self._busy_workers.add(worker)
+            else:
+                self._retiring_workers.add(worker)
+            self._available.notify_all()
+        if accepted:
+            return worker
+        self._close_worker(worker)
+        # Configuration may have changed while CreateProcess was running.
+        # Re-evaluate it without sending a request through an excess child.
+        return self._acquire_worker(deadline)
+
     def _run(self, function, room, settings):
         if self._closed.is_set():
             return _failure(stopped=True)
         with self._lock:
             isolated = self._isolation_enabled and settings.get('monitor_process_isolation', True)
         if not isolated:
-            previous = getattr(self._local, 'worker', None)
-            self._local.worker = None
-            if previous is not None:
-                self._close_worker(previous)
             return function(room, settings)
         deadline = settings.get('_probe_deadline')
         if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
@@ -195,57 +253,31 @@ class ProbePool:
                 timeout = 12
             deadline = time.monotonic() + timeout
             settings['_probe_deadline'] = deadline
-        if time.monotonic() >= deadline:
-            return _failure(deadline=True)
-        worker = getattr(self._local, 'worker', None)
+        worker = None
         try:
-            if worker is not None:
-                with self._lock:
-                    unusable = worker._closed.is_set() or worker in self._retiring_workers or worker.process.poll() is not None
-                    isolated = self._isolation_enabled
-                    if not unusable and isolated:
-                        self._busy_workers.add(worker)
-                if unusable:
-                    # A background retirement may still hold a live process.
-                    # Wait here before replacing it so the process count never
-                    # temporarily exceeds the executor's worker limit.
-                    self._close_worker(worker)
-                    self._local.worker = None
-                    worker = None
-                if not isolated:
-                    return function(room, settings)
+            worker = self._acquire_worker(deadline)
             if worker is None:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError()
-                worker = _WorkerProcess()
-                with self._lock:
-                    accepted = not self._closed.is_set() and self._isolation_enabled
-                    if accepted:
-                        if getattr(self._local, 'started', False):
-                            self._process_restarts += 1
-                        self._local.started = True
-                        self._local.worker = worker
-                        self._workers.add(worker)
-                        self._busy_workers.add(worker)
-                if not accepted:
-                    worker.close()
-                    return _failure(stopped=True) if self._closed.is_set() else function(room, settings)
+                return _failure(stopped=True) if self._closed.is_set() else function(room, settings)
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
             return worker.exchange(room, settings, deadline)
         except (TimeoutError, OSError, ValueError, TypeError, RecursionError, queue.Full) as exc:
             timed_out = isinstance(exc, TimeoutError)
             with self._lock:
                 if timed_out and not self._closed.is_set():
                     self._process_timeouts += 1
-                self._local.worker = None
             if worker is not None:
                 self._close_worker(worker)
             return _failure(deadline=timed_out, stopped=self._closed.is_set())
         finally:
-            with self._lock:
+            with self._available:
                 self._busy_workers.discard(worker)
-                retire = worker in self._workers and not self._isolation_enabled
+                retire = worker in self._workers and (
+                    not self._isolation_enabled or self._closed.is_set()
+                    or len(self._workers - self._retiring_workers) > self._worker_limit)
                 if retire:
                     self._retiring_workers.add(worker)
+                self._available.notify_all()
             if retire:
                 self._close_worker(worker)
 
@@ -253,40 +285,54 @@ class ProbePool:
         try:
             worker.close()
         finally:
-            with self._lock:
+            with self._available:
+                if worker in self._workers:
+                    self._restart_credits += 1
                 self._workers.discard(worker)
                 self._busy_workers.discard(worker)
                 self._retiring_workers.discard(worker)
+                self._available.notify_all()
 
     def _retire_idle(self, workers):
         for worker in workers:
             self._close_worker(worker)
 
-    def configure(self, settings):
-        """Apply mode changes without waiting for pipe or process shutdown.
+    def _start_retirement_locked(self, workers):
+        workers = set(workers) - self._retiring_workers
+        if not workers:
+            return
+        self._retiring_workers.update(workers)
+        self._retire_threads = {thread for thread in self._retire_threads if thread.is_alive()}
+        thread = threading.Thread(target=self._retire_idle, args=(list(workers),),
+                                  name='probe-retire', daemon=True)
+        self._retire_threads.add(thread)
+        try:
+            thread.start()
+        except RuntimeError:
+            self._retire_threads.discard(thread)
+            self._retiring_workers.difference_update(workers)
+            raise
 
-        Idle children are retired in the background. In-flight probes finish
-        under their existing deadline, then release their process. Old queued
-        settings cannot start a new process after isolation has been disabled.
+    def configure(self, settings):
+        """Apply current process width and isolation without blocking the UI.
+
+        Excess idle children retire immediately in the background. Busy ones
+        finish under their existing deadline, then retire until the new limit
+        is met. Old request snapshots cannot override this current limit.
         """
-        with self._lock:
+        with self._available:
             self._isolation_enabled = bool(settings.get('monitor_process_isolation', True))
-            if self._closed.is_set() or self._isolation_enabled:
-                return
-            idle = self._workers - self._busy_workers - self._retiring_workers
-            if not idle:
-                return
-            self._retiring_workers.update(idle)
-            self._retire_threads = {thread for thread in self._retire_threads if thread.is_alive()}
-            thread = threading.Thread(target=self._retire_idle, args=(list(idle),),
-                                      name='probe-retire', daemon=True)
-            self._retire_threads.add(thread)
-            try:
-                thread.start()
-            except RuntimeError:
-                self._retire_threads.discard(thread)
-                self._retiring_workers.difference_update(idle)
-                raise
+            width_key = ('status_check_concurrency' if settings.get('status_only_mode', True)
+                         else 'monitor_batch_size')
+            width = settings.get(width_key, self._worker_limit)
+            if isinstance(width, int) and not isinstance(width, bool):
+                self._worker_limit = max(1, min(self._max_workers, width))
+            if not self._closed.is_set():
+                idle = self._workers - self._busy_workers - self._retiring_workers
+                excess = max(0, len(self._workers - self._retiring_workers) - self._worker_limit)
+                retire = idle if not self._isolation_enabled else set(list(idle)[:excess])
+                self._start_retirement_locked(retire)
+            self._available.notify_all()
 
     def stats(self):
         with self._lock:
@@ -295,10 +341,11 @@ class ProbePool:
                         process_timeouts=self._process_timeouts)
 
     def shutdown(self, wait=True, *, cancel_futures=True):
-        with self._lock:
+        with self._available:
             self._closed.set()
             workers = list(self._workers)
             retire_threads = list(self._retire_threads)
+            self._available.notify_all()
         # Terminate before executor.shutdown: active requests may otherwise
         # retain their full request budget during application shutdown.
         for worker in workers:
@@ -308,4 +355,3 @@ class ProbePool:
             for thread in retire_threads:
                 if thread is not threading.current_thread():
                     thread.join()
-

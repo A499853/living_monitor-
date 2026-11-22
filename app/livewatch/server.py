@@ -281,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "PUT" and path == "/api/settings":
                 previous=self.server.store.get_settings()
                 self.server.store.update_settings(body)
-                if any(key in body and body[key]!=previous.get(key) for key in ('douyin_cookie','douyin_user_agent','douyin_access_mode')):
+                if any(key in body and body[key]!=previous.get(key) for key in ('douyin_cookie','douyin_user_agent','douyin_access_mode','monitor_identity_isolation')):
                     changed=getattr(self.server.engine,'auth_changed',None)
                     if changed: changed()
                 changed=getattr(self.server.engine,'settings_changed',None)

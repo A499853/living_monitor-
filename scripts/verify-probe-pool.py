@@ -114,6 +114,9 @@ class ProbePoolChecks(unittest.TestCase):
         self.assertEqual(result.nickname, '隔离检查')
 
     def test_slow_loopback_endpoint_respects_total_deadline(self):
+        # Measure the network deadline independently of cold process startup,
+        # which can consume the short budget under parallel suite load.
+        self.assertIs(self.submit().result(timeout=5).live, False)
         self.server.slow_entered.clear()
         self.server.release_slow.clear()
         slow_room = dict(self.room, status_url=self.room['status_url'].replace('/status', '/slow'))
@@ -336,6 +339,99 @@ class ProbePoolChecks(unittest.TestCase):
         self.assertTrue(replacement_started.is_set())
         self.assertIsNotNone(old.process.poll())
         self.assertEqual(self.pool.stats()['active_processes'], 1)
+
+    def wider_pool(self, width, limit):
+        self.pool.shutdown()
+        self.pool = ProbePool(self.provider, max_workers=width)
+        self.addCleanup(self.pool.shutdown)
+        self.pool.configure(dict(status_only_mode=True, status_check_concurrency=limit))
+        self.server.slow_entered.clear()
+        self.server.release_slow.clear()
+        self.addCleanup(self.server.release_slow.set)
+        return dict(self.room, status_url=self.room['status_url'].replace('/status', '/slow'))
+
+    def test_idle_children_are_shared_when_executor_threads_change(self):
+        slow = self.wider_pool(8, 2)
+        warm = [self.submit(5, room=slow) for _ in range(2)]
+        wait_for(lambda: len(self.pool._busy_workers) == 2)
+        self.server.release_slow.set()
+        self.assertTrue(all(future.result(timeout=5).live is False for future in warm))
+        original_pids = {worker.process.pid for worker in self.workers()}
+        self.assertEqual(len(original_pids), 2)
+        # Occupy all original executor threads with direct tasks. New isolated
+        # probes must run on other threads and still lease the same children.
+        barrier = threading.Barrier(len(self.pool._executor._threads) + 1)
+        release = threading.Event()
+        def direct(*_args):
+            barrier.wait(timeout=3)
+            release.wait(5)
+            return ProbeResult(False)
+        blockers = [self.pool.submit(direct, self.room, dict(monitor_process_isolation=False))
+                    for _ in range(barrier.parties - 1)]
+        try:
+            barrier.wait(timeout=3)
+            fresh = [self.submit(3) for _ in range(2)]
+            self.assertTrue(all(future.result(timeout=5).live is False for future in fresh))
+            self.assertGreater(len(self.pool._executor._threads), 2)
+            self.assertEqual({worker.process.pid for worker in self.workers()}, original_pids)
+            self.assertEqual(self.pool.stats()['active_processes'], 2)
+        finally:
+            release.set()
+            for future in blockers:
+                future.result(timeout=5)
+
+    def test_lowering_width_drains_running_children_before_new_leases(self):
+        slow = self.wider_pool(8, 3)
+        running = [self.submit(5, room=slow) for _ in range(3)]
+        wait_for(lambda: len(self.pool._busy_workers) == 3)
+        original_pids = {worker.process.pid for worker in self.workers()}
+        began = time.monotonic()
+        self.pool.configure(dict(status_only_mode=True, status_check_concurrency=1))
+        self.assertLess(time.monotonic() - began, .2)
+        queued = self.submit(4, status_check_concurrency=64)
+        wait_for(queued.running)
+        time.sleep(.1)
+        self.assertFalse(queued.done())
+        self.assertEqual({worker.process.pid for worker in self.workers()}, original_pids)
+        self.server.release_slow.set()
+        self.assertTrue(all(future.result(timeout=5).live is False for future in running))
+        self.assertIs(queued.result(timeout=5).live, False)
+        wait_for(lambda: self.pool.stats()['active_processes'] == 1)
+        self.assertTrue({worker.process.pid for worker in self.workers()} <= original_pids)
+
+    def test_hot_growth_then_idle_shrink_keeps_real_process_count_bounded(self):
+        slow = self.wider_pool(8, 2)
+        for limit in (2, 4):
+            self.server.release_slow.clear()
+            self.pool.configure(dict(status_only_mode=True, status_check_concurrency=limit))
+            futures = [self.submit(5, room=slow) for _ in range(limit)]
+            wait_for(lambda: len(self.pool._busy_workers) == limit)
+            self.assertEqual(self.pool.stats()['active_processes'], limit)
+            self.server.release_slow.set()
+            self.assertTrue(all(future.result(timeout=5).live is False for future in futures))
+        old_workers = self.workers()
+        began = time.monotonic()
+        self.pool.configure(dict(status_only_mode=False, monitor_batch_size=1))
+        self.assertLess(time.monotonic() - began, .2)
+        wait_for(lambda: self.pool.stats()['active_processes'] == 1)
+        self.assertEqual(sum(worker.process.poll() is None for worker in old_workers), 1)
+        self.assertIs(self.submit().result(timeout=5).live, False)
+        self.assertEqual(self.pool.stats()['active_processes'], 1)
+
+    def test_waiting_for_process_capacity_obeys_request_deadline(self):
+        slow = self.wider_pool(4, 1)
+        running = self.submit(5, room=slow)
+        self.assertTrue(self.server.slow_entered.wait(3))
+        began = time.monotonic()
+        waiting = self.submit(.2)
+        result = waiting.result(timeout=2)
+        self.assertLess(time.monotonic() - began, 1)
+        self.assertIsNone(result.live)
+        self.assertIn('network=deadline', result.diagnostic)
+        self.assertEqual(self.pool.stats()['active_processes'], 1)
+        self.assertFalse(running.done())
+        self.server.release_slow.set()
+        self.assertIs(running.result(timeout=5).live, False)
 
     def test_orphan_worker_exits_even_while_probe_is_blocked(self):
         with tempfile.TemporaryDirectory(prefix='livewatch-parent-probe-') as directory:

@@ -172,11 +172,17 @@ class RestorationChecks(unittest.TestCase):
         settings = {"monitor_batch_size": 16, "monitor_interval_minutes": 1.5,
                     "monitor_schedule_mode": "batch", "monitor_douyin_concurrency": 2,
                     "monitor_process_isolation": True,
+                    "status_only_mode": True, "status_check_concurrency": 48,
+                    "status_douyin_concurrency": 24, "status_poll_interval_seconds": 3,
+                    "status_request_timeout": 2, "monitor_identity_isolation": True,
                     "room_check_delay_seconds": 2, "ffmpeg_path": str(FFMPEG)}
         backend.json("PUT", "/api/settings", settings)
         for invalid in ({"monitor_batch_size": 17}, {"monitor_batch_size": True},
                         {"monitor_douyin_concurrency": 6}, {"monitor_douyin_concurrency": 0},
-                        {"monitor_process_isolation": 1}, {"monitor_schedule_mode": "invalid"}):
+                        {"monitor_process_isolation": 1}, {"monitor_schedule_mode": "invalid"},
+                        {"status_check_concurrency": 65}, {"status_douyin_concurrency": True},
+                        {"status_douyin_concurrency": 0}, {"status_only_mode": 1},
+                        {"status_poll_interval_seconds": 0}, {"status_request_timeout": 16}):
             self.assertEqual(backend.request("PUT", "/api/settings", invalid)[0], 400)
         room = {"platform": "douyin", "room_input": "restore_smoke_20261121",
                 "nickname": "离线恢复测试", "monitor_enabled": False,

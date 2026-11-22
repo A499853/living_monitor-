@@ -138,6 +138,10 @@ class MonitorConcurrencyChecks(unittest.TestCase):
             "monitor_douyin_concurrency": cap, "room_check_delay_seconds": 0,
             "monitor_interval_minutes": 0.1, "sound_enabled": False,
             "min_free_disk_gib": 0,
+            # These tests exercise the legacy metadata scheduler invariants.
+            # The production high-frequency profile is covered separately by
+            # verify-high-frequency-monitor.py.
+            "status_only_mode": False,
         })
         rooms = []
         for name in names:

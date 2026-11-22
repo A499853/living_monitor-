@@ -18,7 +18,13 @@ def room_directory(room):
 class Store:
     FIELDS = {'platform','room_input','nickname','monitor_enabled','record_enabled','remark','stream_url','status_url','request_headers','input_type','transfer_options'}
     # poll_interval is retained only to read older settings; monitoring uses rounds.
-    DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'douyin_access_mode':'anonymous'}
+    # The high-frequency status profile is intentionally separate from the
+    # recording/metadata cadence.  Five seconds is the target interval for a
+    # status-only fleet; callers can raise it when a provider or network is
+    # more restrictive.  A bounded 32-worker pool is enough to service 150
+    # rooms with sub-second mean latency while keeping requests serialized.
+    # This is a capacity target; outages and platform throttling can miss it.
+    DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'status_only_mode':True,'status_poll_interval_seconds':5,'status_check_concurrency':32,'status_douyin_concurrency':32,'status_request_timeout':4,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'douyin_access_mode':'anonymous','monitor_identity_isolation':True}
     def __init__(self, root):
         self.root = Path(root).resolve()
         for name in ['data','logs','video','time_begin_over']:
@@ -191,10 +197,24 @@ class Store:
                 count=value[key]
                 if isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=maximum:
                     raise ValueError(f'{label}必须为 1～{maximum} 之间的整数')
+        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,15,'高频状态请求超时')]:
+            if key in value:
+                number=value[key]
+                if isinstance(number,bool) or not isinstance(number,(int,float)) or not math.isfinite(number) or not lo<=number<=hi:
+                    raise ValueError(f'{label}必须为 {lo}～{hi} 之间的数值')
+        for key,label in [('status_check_concurrency','高频状态检查并发上限'),('status_douyin_concurrency','高频抖音检查并发上限')]:
+            if key in value:
+                count=value[key]
+                if isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=64:
+                    raise ValueError(label+'必须为 1～64 之间的整数')
+        if 'status_only_mode' in value and not isinstance(value['status_only_mode'],bool):
+            raise ValueError('高频状态模式必须为布尔值')
         if 'monitor_schedule_mode' in value and value['monitor_schedule_mode'] not in ('independent','batch'):
             raise ValueError('监控调度方式必须为 independent 或 batch')
         if 'monitor_process_isolation' in value and not isinstance(value['monitor_process_isolation'],bool):
             raise ValueError('监控进程隔离设置必须为布尔值')
+        if 'monitor_identity_isolation' in value and not isinstance(value['monitor_identity_isolation'],bool):
+            raise ValueError('手机观看身份隔离设置必须为布尔值')
         for key,label in [('recording_retention_days','录制保留天数'),('log_retention_days','日志保留天数')]:
             if key in value and (isinstance(value[key],bool) or not isinstance(value[key],int) or not 0<=value[key]<=3650):
                 raise ValueError(label+'必须为 0～3650 之间的整数（0 表示关闭自动清理）')
