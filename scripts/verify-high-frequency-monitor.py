@@ -463,6 +463,98 @@ class IndependentStatusChecks(unittest.TestCase):
         self.assertEqual(self.engine.snapshot()['rooms'][0]['room_status'],'waiting')
         self.assertFalse(any(e['kind']=='live_started' for e in self.store.list_events()))
 
+    def test_empty_api_advisory_does_not_pause_fleet_after_rescue_exhaustion(self):
+        self.configure(['empty','missing','temporary','healthy'],concurrency=3)
+        self.engine._tick()
+        for name,diagnostic in [('empty','body=empty'),('missing','body=missing_room'),('temporary','platform_status=30003')]:
+            self.finish(name,ProbeResult(None,error_code='anonymous_restricted',retry_after=300,diagnostic=diagnostic+' stage=room_web_enter'))
+        self.clock.now+=11
+        self.engine._tick();self.finish('healthy',ProbeResult(True))
+        self.assertEqual(self.engine.douyin_blocked_until,0)
+        self.assertEqual(self.engine.douyin_rejections,{})
+        for name in ('empty','missing','temporary'):
+            self.assertLessEqual(self.engine._status_due_at(self.rooms[name]['id'],self.store.get_settings()),self.clock.now+5)
+        self.clock.now+=5
+        self.engine._tick()
+        for name in ('empty','missing','temporary'): self.finish(name,ProbeResult(True),number=2)
+        self.assertTrue(all(room['live_status']=='live' for room in self.engine.snapshot()['rooms']))
+        self.assertFalse(any(event['kind']=='live_ended' for event in self.store.list_events()))
+
+    def test_real_restrictions_and_server_retry_after_keep_cooldowns(self):
+        self.configure(['a','b','c'],concurrency=3)
+        for code,advice,diagnostic,minimum in [
+            ('anonymous_restricted',300,'http=401 body=empty',300),
+            ('anonymous_restricted',300,'http=403 body=empty',300),
+            ('rate_limited',60,'http=429 body=empty',60),
+            ('rate_limited',60,'http=444 body=empty',60),
+            ('anonymous_restricted',120,'body=verification',120),
+            ('anonymous_restricted',45,'body=empty retry_after=45',45),
+            ('anonymous_restricted',45,'body=empty page_retry_after=45',45),
+        ]:
+            with self.subTest(diagnostic=diagnostic):
+                self.engine.douyin_blocked_until=0;self.engine.douyin_rejections.clear()
+                for room in self.rooms.values():
+                    state=self.engine._state(room);state['failure_count']=0
+                    self.engine._handle_probe_error(room,state,'restricted',code,advice,diagnostic)
+                    self.assertGreaterEqual(self.engine.due[room['id']],self.clock.now+minimum)
+                self.assertGreaterEqual(self.engine.douyin_blocked_until,self.clock.now+minimum)
+                self.assertFalse(self.engine.recoveries)
+
+    def test_successful_page_refresh_keeps_eight_second_checks_and_fast_offline_confirmation(self):
+        self.configure(['one']);self.store.update_settings({'status_poll_interval_seconds':8})
+        rid=self.rooms['one']['id']
+        self.engine._tick();self.finish('one',ProbeResult(True,retry_after=30,diagnostic='stage=room_page'))
+        page_deadline=self.clock.now+30
+        self.assertEqual(self.engine.states[rid]['_status_page_not_before'],page_deadline)
+        self.assertEqual(self.engine._status_due_at(rid,self.store.get_settings()),self.clock.now+8)
+        self.clock.now+=8;self.engine._tick()
+        self.assertEqual(self.provider.wait_call('one',2)['settings']['_status_page_not_before'],page_deadline)
+        self.finish('one',ProbeResult(False,retry_after=30,diagnostic='stage=room_web_enter'),number=2)
+        self.assertEqual(self.engine._status_due_at(rid,self.store.get_settings()),self.clock.now+1)
+        self.assertTrue(self.engine.states[rid]['confirmed_live'])
+        self.clock.now+=1;self.engine._tick();self.finish('one',ProbeResult(False),number=3)
+        self.assertFalse(self.engine.states[rid]['confirmed_live'])
+
+    def test_page_cooldown_diagnostic_does_not_slide_deadline(self):
+        self.configure(['one']);rid=self.rooms['one']['id']
+        self.engine._tick();self.finish('one',ProbeResult(True,diagnostic='stage=room_page'))
+        page_deadline=self.engine.states[rid]['_status_page_not_before']
+        self.clock.now+=5;self.engine._tick()
+        self.finish('one',ProbeResult(None,error_code='anonymous_restricted',retry_after=300,
+                                    diagnostic='stage=room_web_enter body=empty page_stage=room_page page_result=cooldown'),number=2)
+        self.assertEqual(self.engine.states[rid]['_status_page_not_before'],page_deadline)
+        self.clock.now+=1;self.engine._tick()
+        self.assertEqual(self.provider.wait_call('one',3)['settings']['_status_page_not_before'],page_deadline)
+        self.finish('one',ProbeResult(True),number=3)
+        self.assertEqual(self.engine.states[rid]['_status_page_not_before'],page_deadline)
+
+    def test_successful_status_still_respects_real_retry_after(self):
+        self.configure(['one']);rid=self.rooms['one']['id']
+        self.engine._tick();self.finish('one',ProbeResult(True,retry_after=30,diagnostic='stage=room_page retry_after=45'))
+        self.assertEqual(self.engine.due[rid],self.clock.now+45)
+        self.clock.now+=8;self.engine._tick()
+        self.assertEqual(len(self.provider.calls),1)
+
+    def test_full_profile_keeps_success_retry_hint(self):
+        self.configure(['one']);self.store.update_settings({'status_only_mode':False,'room_check_delay_seconds':0})
+        self.engine._tick();self.finish('one',ProbeResult(True,retry_after=30,diagnostic='stage=room_page'))
+        self.assertEqual(self.engine.due[self.rooms['one']['id']],self.clock.now+30)
+
+    def test_two_successful_trials_release_global_restriction(self):
+        self.configure(['a','b','c','fresh'],concurrency=3)
+        self.engine._tick()
+        for name in ('a','b','c'): self.finish(name,ProbeResult(None,error_code='rate_limited',retry_after=60,diagnostic='http=444'))
+        self.clock.now=self.engine.douyin_blocked_until;self.engine._tick()
+        self.finish('fresh',ProbeResult(True))
+        self.assertEqual(self.engine.douyin_recovery_successes,1)
+        self.assertEqual(self.engine.douyin_blocked_until,self.clock.now+5)
+        self.clock.now+=5;self.engine._tick()
+        names=[name for name,room in self.rooms.items() if room['id'] in self.engine.pending]
+        self.assertEqual(len(names),1)
+        self.finish(names[0],ProbeResult(True),number=2)
+        self.assertEqual(self.engine.douyin_blocked_until,0)
+        self.assertEqual(self.engine.douyin_rejections,{})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

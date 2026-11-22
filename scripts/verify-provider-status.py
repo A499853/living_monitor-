@@ -32,6 +32,11 @@ class ProviderStatusChecks(unittest.TestCase):
                          "_probe_deadline": time.monotonic() + 4}
         self.room = {"platform": "douyin", "room_input": "123", "input_type": "room",
                      "record_enabled": False, "request_headers": {}}
+        # These checks exercise the compact warm path; visitor initialization
+        # and bounded page recovery have their own cold-worker contract tests.
+        self.provider._auth_state(self.settings)
+        self.provider._local.status_bootstrapped=True
+        self.provider._page_attempts['123']=time.monotonic()+30
 
     @staticmethod
     def response(value):
@@ -52,7 +57,7 @@ class ProviderStatusChecks(unittest.TestCase):
         # recording compatibility; it is never fetched by the status probe.
         self.assertEqual(result.stream_url, "https://media.invalid/live.m3u8")
 
-    def test_failed_status_never_falls_back_to_html_or_media(self):
+    def test_failed_status_respects_recent_page_cooldown_without_media_requests(self):
         responses = [self.response({"data": {"data": []}}),
                      (b"<html><title>verification</title></html>", {}, "https://live.douyin.com/123"),
                      ProbeError("offline network", "network_error", 30),

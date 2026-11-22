@@ -296,6 +296,7 @@ class Engine:
         refresh=bool(state.pop('_source_refresh_requested',False))
         state['source_refreshing']=refresh
         return dict(settings,_probe_deadline=deadline,
+                    _status_page_not_before=state.get('_status_page_not_before',0),
                     _status_only=bool(settings.get('status_only_mode',True)) and not refresh)
 
     def _tick_status(self,eligible,settings,now):
@@ -447,6 +448,11 @@ class Engine:
             except Exception as exc:
                 code='network_error' if isinstance(exc,(OSError,TimeoutError)) else ''
                 self._handle_probe_error(room,state,'检查失败：'+safe_message(exc),code); return
+            result_facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(getattr(result,'diagnostic','')).split())
+            if (result_facts.get('stage')=='room_page' or result_facts.get('page_stage')=='room_page') and result_facts.get('page_result')!='cooldown':
+                # The room's page budget belongs to the coordinator, so a new
+                # pooled worker cannot bypass an earlier worker's refresh wait.
+                state['_status_page_not_before']=time.monotonic()+30
             # Nickname and avatar are room metadata, also useful while offline.
             if result.nickname and result.nickname!=room['nickname']:
                 room=self.store.update_room(rid,{'nickname':str(result.nickname)[:160]})
@@ -479,8 +485,13 @@ class Engine:
                         self.store.append_event('monitor_recovered',room,'连续两次试探检查成功，恢复设定的每批检查数量。')
                     else:
                         self.douyin_blocked_until=max(self.douyin_blocked_until,time.monotonic()+5)
-                if getattr(result,'retry_after',0):
-                    self.due[rid]=max(self.due.get(rid,0),time.monotonic()+self._retry_delay(result.retry_after))
+                success_retry=max(int(result_facts.get('retry_after','0')),int(result_facts.get('page_retry_after','0')))
+                if not self.store.get_settings().get('status_only_mode',True):
+                    success_retry=max(success_retry,self._retry_delay(getattr(result,'retry_after',0)))
+                # Large-page refresh has its own room budget. Successful
+                # compact checks and offline confirmation keep their cadence.
+                if success_retry:
+                    self.due[rid]=max(self.due.get(rid,0),time.monotonic()+success_retry)
             # Ending a live session stops recording, so require consecutive
             # explicit offline observations for every source and profile.
             # Errors reset this count and never close the existing session.
@@ -669,18 +680,22 @@ class Engine:
         state['detection_uncertain']=True
         state['offline_checks']=0
         state.pop('_offline_recheck_at',None)
+        facts=dict(token.split('=',1) for token in diagnostic.split())
+        transient=self._transient_error(error_code,diagnostic)
+        server_retry=max(int(facts.get('retry_after','0')),int(facts.get('page_retry_after','0')))
         if self._adaptive_room(room):
             now=time.monotonic()
-            restricted=error_code in ('anonymous_restricted','rate_limited','verification_required')
+            restricted=not transient and (error_code in ('anonymous_restricted','rate_limited','verification_required')
+                         or facts.get('http') in ('401','403','429','444')
+                         or facts.get('page_http') in ('401','403','429','444')
+                         or facts.get('body')=='verification' or facts.get('page_body')=='verification')
             network_failure=error_code=='network_error'
             if self.store.get_settings().get('status_only_mode',True) and not restricted:
-                # A broken local connection is not evidence that every room is
-                # rate limited. Keep retrying this room on its bounded cadence.
-                facts=dict(token.split('=',1) for token in diagnostic.split())
-                # Network ProbeError uses a legacy advisory 30-second retry;
-                # only an actual server Retry-After may postpone fast recovery.
-                explicit=max(int(facts.get('retry_after','0')),int(facts.get('page_retry_after','0')),
-                             0 if network_failure else self._retry_delay(retry_after))
+                # Empty compact API responses and transport errors are not
+                # evidence of platform-wide restrictions. Their legacy 30/300
+                # second library hints must not become a fleet-wide cooldown
+                # after the short rescue window ends.
+                explicit=max(server_retry,0 if transient or network_failure else self._retry_delay(retry_after))
                 state['_error_recheck_at']=now+min(5,self.store.get_settings().get('status_poll_interval_seconds',8))
                 self.due[room['id']]=now+explicit
                 state['status_note']='检测尚未恢复，继续独立重试'
@@ -710,9 +725,7 @@ class Engine:
                 self.douyin_recovery_successes=0
                 self.douyin_blocked_until=max(self.douyin_blocked_until,now+cooldown)
             return
-        facts=dict(token.split('=',1) for token in diagnostic.split())
-        explicit=max(0 if error_code=='network_error' else self._retry_delay(retry_after),
-                     int(facts.get('retry_after','0')),int(facts.get('page_retry_after','0')))
+        explicit=max(0 if transient or error_code=='network_error' else self._retry_delay(retry_after),server_retry)
         self.due[room['id']]=max(self.due.get(room['id'],0),time.monotonic()+explicit) if explicit else self.due.get(room['id'],0)
         state['_error_recheck_at']=time.monotonic()+min(5,self.store.get_settings().get('status_poll_interval_seconds',8))
     def _sound(self):
@@ -912,7 +925,7 @@ class Engine:
                     state.update(source_identity=identity,source_room=dict(room),resolved_stream_url='',stream_variants=[],resolved_room_input='',record_headers={},confirmed_live=None,live_status='checking',live_started_at='',observed_started_at='',started_at_source='',live_session_id='',avatar_url='',live_ended_at='',platform_ended_at='',offline_checks=0,status_note='',last_error='',error_code='',error_diagnostic='',failure_count=0,retry_at=0,duration_seconds=0,record_path='',record_status='idle')
                     state.update(last_success_at='',last_attempt_at='',last_probe_latency_seconds=None,_last_success_monotonic=None)
                     state.update(detection_uncertain=True,last_check_finished_at='',last_actual_check_interval_seconds=None)
-                    for key in ('_offline_recheck_at','_error_recheck_at','_last_attempt_monotonic'): state.pop(key,None)
+                    for key in ('_offline_recheck_at','_error_recheck_at','_last_attempt_monotonic','_status_page_not_before'): state.pop(key,None)
                     self.due[room['id']]=0
                     self._persist(room['id'],state)
                 if not room['monitor_enabled']:

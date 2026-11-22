@@ -829,17 +829,30 @@ def _pick_url(stream):
 def _is_room(value):
     return isinstance(value, dict) and any(key in value for key in ('stream_url', 'owner', 'id_str', 'room_id', 'roomId', 'title'))
 
-def _target_room(payload):
+def _target_room(payload,include_identity=False):
     """Select the requested room, never a recommendation elsewhere in a response."""
+    def selected(room,fallback,container=None):
+        identities=[]
+        if isinstance(room,dict):
+            # Keep identity attached to the same selected object, including
+            # supported nested roomInfo containers and their selected owner.
+            sources=[room,container]
+            sources.extend(room.get(key) for key in ('owner','anchor','user'))
+            if isinstance(container,dict): sources.append(container.get('anchor'))
+            for source in sources:
+                if isinstance(source,dict):
+                    identities.extend(source[key] for key in ('web_rid','webRid')
+                                      if source.get(key) not in (None,''))
+        return (room,fallback,identities) if include_identity else (room,fallback)
     data = payload.get('data')
     if isinstance(data, dict) and 'data' in data:
         rooms = data['data']
         room = rooms[0] if isinstance(rooms, list) and rooms and isinstance(rooms[0], dict) else None
-        return room, _nickname(data)
+        return selected(room,_nickname(data),data)
     if isinstance(data, dict) and _is_room(data.get('room')):
-        return data['room'], _nickname(data)
+        return selected(data['room'],_nickname(data),data)
     if _is_room(payload) and 'status' in payload:
-        return payload, ''
+        return selected(payload,'')
     # Supported page-state containers only. Never recursively select arbitrary
     # objects with status=2: pages also contain unrelated live recommendations.
     queue = [payload]
@@ -856,24 +869,26 @@ def _target_room(payload):
                 room = dict(info['room'])
                 if not any(isinstance(room.get(k), dict) for k in ('owner', 'anchor', 'user')) and isinstance(info.get('anchor'), dict):
                     room['owner'] = info['anchor']
-                return room, _nickname(info)
+                return selected(room,_nickname(info),info)
             if _is_room(container.get('room')):
-                return container['room'], _nickname(container)
+                return selected(container['room'],_nickname(container),container)
             for key in allowed:
                 child = container.get(key)
                 if isinstance(child, dict):
                     next_level.append(child)
         queue = next_level
-    return None, ''
+    return selected(None,'')
 
-def parse_douyin_data(payload, expected_sec_uid=''):
+def parse_douyin_data(payload, expected_sec_uid='',expected_web_rid=''):
     if not isinstance(payload, dict):
         return ProbeResult(None, message='抖音返回了无法识别的数据。')
     if payload.get('status_code') not in (None, 0):
         status_code = payload.get('status_code')
         diagnostic = 'platform_status=' + str(status_code) if type(status_code) in (int, str) and re.fullmatch(r'-?[0-9]{1,9}', str(status_code)) else ''
         return ProbeResult(None, message='抖音接口返回平台错误，尚不能确认直播状态。', error_code='auth_required', retry_after=300, diagnostic=diagnostic)
-    room, fallback = _target_room(payload)
+    room,fallback,identities=_target_room(payload,include_identity=True)
+    if expected_web_rid and any(type(value) not in (str,int) or str(value)!=str(expected_web_rid) for value in identities):
+        return ProbeResult(None,message='页面返回了非目标直播间，已拒绝使用。',error_code='target_mismatch')
     status = room.get('status') if isinstance(room, dict) else None
     if type(status) is int and status in (2, 4) and _is_room(room):
         if expected_sec_uid:
@@ -944,11 +959,7 @@ def _page_states(body):
 
 def parse_douyin_html(body, expected_sec_uid='', expected_web_rid=''):
     for state in _page_states(body):
-        info = state.get('roomStore', {}).get('roomInfo', {}) if isinstance(state, dict) else {}
-        rid = info.get('web_rid') if isinstance(info, dict) else None
-        if expected_web_rid and rid is not None and str(rid) != str(expected_web_rid):
-            return ProbeResult(None, message='页面返回了非目标直播间，已拒绝使用。', error_code='target_mismatch')
-        result = parse_douyin_data(state, expected_sec_uid)
+        result = parse_douyin_data(state,expected_sec_uid,expected_web_rid)
         if result.live is not None or result.error_code == 'target_mismatch':
             return result
     if _verification_page(body):
@@ -1007,6 +1018,7 @@ class ProviderRegistry:
         self._auth_pinned = False
         self._page_attempts = {}
         self._page_failures = {}
+        self._status_page_pending = set()
         self._share_cache = {}
 
     @staticmethod
@@ -1019,6 +1031,7 @@ class ProviderRegistry:
         self._account_cache.clear()
         self._page_attempts.clear()
         self._page_failures.clear()
+        self._status_page_pending.clear()
         self._share_cache.clear()
 
     def invalidate_auth(self, settings=None):
@@ -1426,8 +1439,10 @@ class ProviderRegistry:
         if isolate_identity:
             request_headers['User-Agent'] = USER_AGENT
         try:
+            page_not_before=settings.get('_status_page_not_before',0)
+            if isinstance(page_not_before,bool) or not isinstance(page_not_before,(int,float)) or not math.isfinite(page_not_before): page_not_before=0
             result = self._douyin_anonymous(kind, identifier, expected_sec_uid, request_headers, monitor_opener, monitor_access,
-                                             status_only=status_only)
+                                             status_only=status_only,status_page_not_before=page_not_before)
             if result.live is None and result.error_code == 'platform_unavailable' and room.get('input_type', 'auto') == 'auto' and not raw.strip().startswith(('@', 'http://', 'https://')):
                 result.message += ' 若填写的是抖音账号，请选择“抖音账号”或在 ID 前加 @。'
             return result
@@ -1439,7 +1454,43 @@ class ProviderRegistry:
                 raise ProbeError(anonymous_error_message('anonymous_restricted', diagnostic), 'anonymous_restricted', max(120, exc.retry_after), diagnostic) from None
             raise ProbeError(str(exc), exc.code, exc.retry_after, diagnostic) from None
 
-    def _douyin_anonymous(self, kind, identifier, expected_sec_uid, request_headers, opener, access='anonymous', status_only=False):
+    def _status_room_page(self,identifier,expected_sec_uid,request_headers,opener,access):
+        """Establish a public visitor and use this exact page's current state.
+
+        Leave time to return through the worker pipe before its hard deadline;
+        otherwise a slow initial response would repeatedly destroy its new jar.
+        """
+        deadline=getattr(_PROBE_CONTEXT,'deadline',None)
+        if deadline is not None and deadline-time.monotonic()<=.35:
+            return ProbeResult(None,message='访客初始化等待下一次有期限检查。',error_code='platform_unavailable',retry_after=1,diagnostic='page_result=cooldown')
+        if deadline is not None: _PROBE_CONTEXT.deadline=deadline-.25
+        try:
+            page,response_headers,resolved=_request('https://live.douyin.com/'+identifier,request_headers,opener=opener)
+        finally:
+            _PROBE_CONTEXT.deadline=deadline
+        self._local.status_bootstrapped=True
+        self._local.bootstrapped=True
+        self._local.last_bootstrap=time.monotonic()
+        final=urllib.parse.urlsplit(resolved)
+        if final.hostname!='live.douyin.com' or final.path.strip('/')!=identifier:
+            return ProbeResult(None,message='页面跳转到了非目标直播间，已停止使用。',error_code='target_mismatch',retry_after=120,diagnostic='stage=room_page')
+        result=_monitor_result(parse_douyin_html(page,expected_sec_uid,identifier),access)
+        result.diagnostic=sanitize_probe_diagnostic(result.diagnostic+' stage=room_page '+_response_diagnostic(page,response_headers))
+        if result.live is not None:
+            result.headers=request_headers
+            result.resolved_room_input='https://live.douyin.com/'+identifier
+        return result
+
+    def _status_page_needed(self,identifier,access,not_before):
+        cold=access=='anonymous' and not getattr(self._local,'status_bootstrapped',False)
+        return cold or identifier in self._status_page_pending and time.monotonic()>=max(not_before,self._page_attempts.get(identifier,0))
+
+    @staticmethod
+    def _status_page_budget():
+        deadline=getattr(_PROBE_CONTEXT,'deadline',None)
+        return TIMEOUT if deadline is None else max(0,deadline-time.monotonic())
+
+    def _douyin_anonymous(self, kind, identifier, expected_sec_uid, request_headers, opener, access='anonymous', status_only=False,status_page_not_before=0):
         if status_only and kind != 'room':
             raise ProbeError('高频状态监控需要固定直播间地址或状态接口。', 'status_source_required', 300)
         page = None
@@ -1448,6 +1499,20 @@ class ProviderRegistry:
         page_retry_after = 0
         generation = getattr(self._local, 'auth_generation', self._auth_generation)
         if access == 'authorized': _scope_monitor_room(opener, identifier if kind == 'room' else '')
+        status_page_attempted=False
+        if status_only and self._status_page_needed(identifier,access,status_page_not_before):
+            with self._metadata_lock:
+                self._status_page_pending.discard(identifier)
+                self._page_attempts[identifier]=time.monotonic()+30
+            status_page_attempted=True
+            try:
+                result=self._status_room_page(identifier,expected_sec_uid,request_headers,opener,access)
+            except ProbeError as exc:
+                raise ProbeError(str(exc),exc.code,exc.retry_after,exc.diagnostic+' stage=room_page') from None
+            if result.live is not None or result.error_code=='target_mismatch': return result
+            page_failure=_page_diagnostic(result.diagnostic,'invalid')
+            if self._status_page_budget()<.75:
+                return result
         if kind == 'page':
             body, response_headers, resolved = _request(identifier, request_headers, opener=opener)
             page_facts = _response_diagnostic(body, response_headers)
@@ -1525,13 +1590,35 @@ class ProviderRegistry:
             api_error_code, api_retry_after = exc.code, exc.retry_after
             api_diagnostic = sanitize_probe_diagnostic(exc.diagnostic + ' stage=room_web_enter ' + api_body_facts + (' access=authorized' if access == 'authorized' else ''))
         if status_only:
-            # Do not spend the rest of a short status deadline on a second
-            # full-page request. Engine retains the last confirmed state and
-            # retries this compact endpoint in the next bounded wave.
+            # Empty compact responses can recover with a normal public page
+            # which refreshes visitor cookies. Bound large-page traffic per room,
+            # and carry it to a later check if this request used its time budget.
+            now=time.monotonic()
+            with self._metadata_lock:
+                page_due=now>=max(status_page_not_before,self._page_attempts.get(identifier,0))
+                if len(self._page_attempts)>2048:
+                    self._page_attempts={key:at for key,at in self._page_attempts.items() if at>now}
+                    self._status_page_pending.intersection_update(self._page_attempts)
+            facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(api_diagnostic).split())
+            server_retry=int(facts.get('retry_after','0'))
+            if not status_page_attempted and page_due and not server_retry:
+                if self._status_page_budget()<.75:
+                    with self._metadata_lock:
+                        if len(self._status_page_pending)<2048: self._status_page_pending.add(identifier)
+                else:
+                    with self._metadata_lock: self._page_attempts[identifier]=now+30
+                    try:
+                        result=self._status_room_page(identifier,expected_sec_uid,request_headers,opener,access)
+                        if result.live is not None or result.error_code=='target_mismatch':
+                            return result
+                        page_failure=_page_diagnostic(result.diagnostic,'invalid')
+                    except ProbeError as exc:
+                        page_failure=_page_diagnostic(exc.diagnostic+' stage=room_page','failed')
+                        page_retry_after=exc.retry_after
             return _monitor_result(ProbeResult(None,
                 message=api_error or '抖音状态接口暂未确认直播状态，稍后自动重试。',
                 error_code=api_error_code or 'platform_unavailable',
-                retry_after=max(api_retry_after, 5), diagnostic=api_diagnostic), access)
+                retry_after=max(api_retry_after,page_retry_after,5),diagnostic=api_diagnostic+' '+page_failure),access)
         now = time.monotonic()
         with self._metadata_lock:
             current_generation = generation == self._auth_generation
