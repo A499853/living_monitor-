@@ -1,5 +1,9 @@
-"""Local Douyin session validation; never exposes cookie values in status."""
-from http.cookies import SimpleCookie
+"""Persistent local Douyin authorization; never exposes cookie values in status.
+
+The saved authorization has no application-imposed expiry. Douyin still owns
+the validity of its server-side session; a transport error or anonymous probe
+restriction must never silently delete the user's saved authorization.
+"""
 
 def cookie_is_authorized(value):
     if not isinstance(value,str) or not value or len(value)>32768 or any(c in value for c in '\r\n\x00'):
@@ -7,6 +11,16 @@ def cookie_is_authorized(value):
     # Douyin's signed-in browser session, not an anonymous bootstrap cookie.
     parts={item.split('=',1)[0].strip():item.split('=',1)[1].strip() for item in value.split(';') if '=' in item}
     return any(parts.get(key) for key in ('sessionid','sessionid_ss','sid_tt'))
+
+
+def authorization_status(value):
+    """Describe local persistence, without claiming to validate a remote session."""
+    authorized = cookie_is_authorized(value)
+    return {
+        'douyin_authorized': authorized,
+        'local_authorization_permanent': authorized,
+        'expires_at': None,
+    }
 
 
 def authorized_monitor_cookie(value):

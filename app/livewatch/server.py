@@ -13,9 +13,10 @@ from urllib.parse import urlsplit, unquote
 
 from . import __version__
 from .avatar import AvatarCache
-from .auth import cookie_is_authorized
+from .auth import cookie_is_authorized, authorization_status
 from .providers import _douyin_input, ProbeError
 from .playback import Playback
+from .media_options import recording_directory
 from .transfer import batch_payloads, decode_import, export_rooms
 
 MAX_BODY = 128 * 1024
@@ -141,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(200, avatar[0], avatar[1])
             if path == "/api/state":
                 state = self.server.engine.snapshot()
-                state["auth"]={"douyin_authorized":cookie_is_authorized(self.server.store.get_settings().get("douyin_cookie",""))}
+                state["auth"]=authorization_status(self.server.store.get_settings().get("douyin_cookie",""))
                 settings = state.get("settings", {})
                 cookie = settings.pop("douyin_cookie", "")
                 settings["douyin_cookie_configured"] = bool(cookie or self.server.store.get_settings().get("douyin_cookie"))
@@ -242,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.store.update_settings({'douyin_cookie':cookie,'douyin_user_agent':body.get('user_agent','')})
                 changed=getattr(self.server.engine,'auth_changed',None)
                 if changed: changed()
-                return self._reply(200, {'ok':True,'douyin_authorized':True})
+                return self._reply(200, {'ok':True,**authorization_status(cookie)})
             if method == "POST" and path == "/api/rooms/batch":
                 payloads = batch_payloads(body.get("text"), body)
                 result = self.server.store.add_rooms(payloads)
@@ -308,7 +309,8 @@ class Handler(BaseHTTPRequestHandler):
                 kind = body.get("kind")
                 if kind not in ("video", "logs", "time_begin_over"):
                     raise ValueError("目录无效。")
-                folder = self.server.root / kind
+                room=self.server.store.get_room(body['room_id']) if kind=='video' and body.get('room_id') else None
+                folder = recording_directory(self.server.root,self.server.store.get_settings(),room) if kind=='video' else self.server.root / kind
                 folder.mkdir(parents=True, exist_ok=True)
                 if os.name == "nt":
                     os.startfile(str(folder))

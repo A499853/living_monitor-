@@ -169,6 +169,7 @@ class ProbePool:
         self._workers = set()
         self._busy_workers = set()
         self._retiring_workers = set()
+        self._rebuild_workers = set()
         self._retire_threads = set()
         self._creating = 0
         self._restart_credits = 0
@@ -176,6 +177,7 @@ class ProbePool:
         self._closed = threading.Event()
         self._process_restarts = 0
         self._process_timeouts = 0
+        self._session_generation = 0
 
     def submit(self, function, room, settings):
         with self._lock:
@@ -207,6 +209,7 @@ class ProbePool:
                     # and pipe cleanup finish, including disable/re-enable races.
                     if len(self._workers) + self._creating < self._worker_limit:
                         self._creating += 1
+                        generation = self._session_generation
                         break
                 self._available.wait(timeout=remaining)
         try:
@@ -223,6 +226,7 @@ class ProbePool:
                 self._restart_credits -= 1
                 self._process_restarts += 1
             accepted = (not self._closed.is_set() and self._isolation_enabled
+                        and generation == self._session_generation
                         and len(self._workers - self._retiring_workers) <= self._worker_limit
                         and len(self._busy_workers) < self._worker_limit)
             if accepted:
@@ -274,6 +278,7 @@ class ProbePool:
                 self._busy_workers.discard(worker)
                 retire = worker in self._workers and (
                     not self._isolation_enabled or self._closed.is_set()
+                    or worker in self._rebuild_workers
                     or len(self._workers - self._retiring_workers) > self._worker_limit)
                 if retire:
                     self._retiring_workers.add(worker)
@@ -291,6 +296,7 @@ class ProbePool:
                 self._workers.discard(worker)
                 self._busy_workers.discard(worker)
                 self._retiring_workers.discard(worker)
+                self._rebuild_workers.discard(worker)
                 self._available.notify_all()
 
     def _retire_idle(self, workers):
@@ -332,6 +338,15 @@ class ProbePool:
                 excess = max(0, len(self._workers - self._retiring_workers) - self._worker_limit)
                 retire = idle if not self._isolation_enabled else set(list(idle)[:excess])
                 self._start_retirement_locked(retire)
+            self._available.notify_all()
+
+    def rebuild_sessions(self):
+        """Replace visitor sessions after active checks drain, without overlap."""
+        with self._available:
+            if self._closed.is_set(): return
+            self._session_generation += 1
+            self._rebuild_workers.update(self._workers)
+            self._start_retirement_locked(self._workers-self._busy_workers)
             self._available.notify_all()
 
     def stats(self):

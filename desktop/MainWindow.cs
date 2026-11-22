@@ -295,6 +295,33 @@ internal sealed class MainWindow : Form
 				}
 				break;
 			}
+			case "choose-recording-directory":
+			{
+				string requestId = message.ContainsKey("request_id") ? Convert.ToString(message["request_id"]) : "";
+				if (requestId.Length > 64)
+				{
+					break;
+				}
+				string selectedPath = message.ContainsKey("path") ? Convert.ToString(message["path"]) : "";
+				using (FolderBrowserDialog picker = new FolderBrowserDialog())
+				{
+					picker.Description = "选择直播录制的存储位置";
+					picker.ShowNewFolderButton = true;
+					picker.SelectedPath = Directory.Exists(selectedPath) ? selectedPath : Path.Combine(data, "video");
+					bool selected = picker.ShowDialog(this) == DialogResult.OK;
+					if (!view.IsDisposed && view.CoreWebView2 != null)
+					{
+						view.CoreWebView2.PostWebMessageAsJson(new JavaScriptSerializer().Serialize(new
+						{
+							@event = "recording-directory-selected",
+							request_id = requestId,
+							path = selected ? picker.SelectedPath : "",
+							cancelled = !selected
+						}));
+					}
+				}
+				break;
+			}
 			}
 		}
 		catch (Exception ex)

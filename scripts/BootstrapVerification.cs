@@ -55,6 +55,11 @@ internal static class BootstrapVerification
             }
             var package = new DependencyBootstrapper.Package { Name = "Python", Target = "python", Required = new[] { "python.exe" }, Sha256 = new string('a', 64) };
             string tools = Path.Combine(root, "tools");
+            var ffmpeg = new DependencyBootstrapper.Package { Name = "FFmpeg", Target = "ffmpeg.exe", Required = new string[0] };
+            Directory.CreateDirectory(tools);
+            Check(!DependencyBootstrapper.IsReady(root, ffmpeg), "missing FFmpeg requires preparation");
+            using (var bundled = File.Create(Path.Combine(tools, "ffmpeg.exe"))) bundled.SetLength(1000001);
+            Check(DependencyBootstrapper.IsReady(root, ffmpeg), "bundled FFmpeg is ready without a download or runtime receipt");
             string target = Path.Combine(tools, "python");
             Directory.CreateDirectory(target);
             File.WriteAllText(Path.Combine(target, "python.exe"), "original");

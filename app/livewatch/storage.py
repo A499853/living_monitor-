@@ -1,9 +1,10 @@
 from __future__ import annotations
 import csv, json, logging, math, re, sqlite3, threading, uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from .avatar import validate_avatar_url, AvatarUnavailable
+from .media_options import QUALITY_PREFERENCES, validate_record_directory
 
 def now_iso():
     return datetime.now().astimezone().isoformat(timespec='seconds')
@@ -16,13 +17,16 @@ def room_directory(room):
     return f"{room['platform']}_{value}_{room['id'][:8]}"
 
 class Store:
-    FIELDS = {'platform','room_input','nickname','monitor_enabled','record_enabled','remark','stream_url','status_url','request_headers','input_type','transfer_options','record_quality','record_protocol'}
+    FIELDS = {'platform','room_input','nickname','monitor_enabled','record_enabled','remark','stream_url','status_url','request_headers','input_type','transfer_options','record_quality','record_protocol','record_directory'}
     # poll_interval is retained only to read older settings; monitoring uses rounds.
     # The high-frequency status profile is intentionally separate from the
     # recording/metadata cadence. Eight seconds after each completed check is
     # the default delay. A bounded 32-worker pool and global dispatch budget
     # protect large fleets; real request and queue latency still apply.
     DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'status_only_mode':True,'status_poll_interval_seconds':8,'status_check_concurrency':32,'status_douyin_concurrency':32,'status_request_timeout':4,'monitor_max_requests_per_second':20,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'record_segment_seconds':1800,'record_stall_seconds':30,'record_start_timeout_seconds':30,'douyin_access_mode':'anonymous','monitor_identity_isolation':True}
+    DEFAULTS.update(status_douyin_concurrency=4, monitor_douyin_requests_per_second=2,
+                    copy_source_quality='below_origin_1', copy_source_protocol='flv',
+                    playback_quality='below_origin_2', playback_protocol='hls', recording_directory='')
     def __init__(self, root):
         self.root = Path(root).resolve()
         for name in ['data','logs','video','time_begin_over']:
@@ -43,9 +47,10 @@ class Store:
         # v1's started_at is a local observation. Preserve it as such; never
         # promote it to the platform's real broadcast start during migration.
         columns={row[1] for row in self.db.execute('PRAGMA table_info(sessions)')}
-        for name in ('actual_started_at','platform_session_id','started_at_source'):
+        for name in ('actual_started_at','platform_session_id','started_at_source','actual_ended_at','ended_at_source'):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        self.db.execute("CREATE INDEX IF NOT EXISTS sessions_pending_end ON sessions(room_id,ended_at DESC) WHERE ended_at<>'' AND actual_ended_at=''")
         room_columns={row[1] for row in self.db.execute('PRAGMA table_info(rooms)')}
         if 'sort_order' not in room_columns:
             self.db.execute('ALTER TABLE rooms ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0')
@@ -63,7 +68,9 @@ class Store:
         room.setdefault('transfer_options',{})
         room.setdefault('record_quality','')
         room.setdefault('record_protocol','')
+        room.setdefault('record_directory','')
         room.update({k:v for k,v in payload.items() if k in self.FIELDS})
+        room['record_directory']=validate_record_directory(room['record_directory'])
         for key in ('record_quality','record_protocol'):
             if not isinstance(room[key],str) or not re.fullmatch(r'[A-Za-z0-9_.-]{0,64}',room[key]):
                 raise ValueError('录制画质或格式无效')
@@ -192,6 +199,18 @@ class Store:
     def update_settings(self,payload):
         if not isinstance(payload,dict) or set(payload)-set(self.DEFAULTS): raise ValueError('无效的设置字段')
         value=dict(payload)
+        for key in ('copy_source_quality','playback_quality'):
+            if key in value and value[key] not in QUALITY_PREFERENCES:
+                raise ValueError('默认直播源画质无效')
+        for key in ('copy_source_protocol','playback_protocol'):
+            if key in value and value[key] not in ('flv','hls'):
+                raise ValueError('默认直播源格式必须为 FLV 或 HLS')
+        if 'recording_directory' in value:
+            value['recording_directory']=validate_record_directory(value['recording_directory'])
+        if 'monitor_douyin_requests_per_second' in value:
+            number=value['monitor_douyin_requests_per_second']
+            if isinstance(number,bool) or not isinstance(number,(int,float)) or not math.isfinite(number) or not 0.2<=number<=20:
+                raise ValueError('抖音每秒检查上限必须为 0.2～20 之间的数值')
         for key,lo,hi,label in [('monitor_interval_minutes',0.1,1440,'整轮检查间隔（分钟）'),('room_check_delay_seconds',0,60,'派发间隔 / 批次停顿（秒）'),('min_free_disk_gib',0,1048576,'磁盘最小剩余空间（GiB）')]:
             if key in value:
                 number=value[key]
@@ -286,6 +305,94 @@ class Store:
         with self.lock:
             row=self.db.execute("SELECT * FROM sessions WHERE room_id=? AND ended_at='' ORDER BY started_at DESC LIMIT 1",(room_id,)).fetchone()
             return dict(row) if row else None
+    def discover_ended_session(self,room,platform_session_id,actual_started_at='',actual_ended_at='',observed_at=''):
+        """Remember a broadcast found offline at the first status observation.
+
+        The application did not observe its start, so started_at stays empty.
+        A matching open session belongs to normal status confirmation and must
+        never be closed by a delayed history response.
+        """
+        if (room.get('platform')!='douyin' or not isinstance(platform_session_id,str)
+                or not re.fullmatch(r'[0-9]{1,32}',platform_session_id)):
+            return ''
+        observed_at=observed_at or now_iso()
+        def valid_time(value,optional=False):
+            if optional and value=='': return None
+            if not isinstance(value,str): raise ValueError('Invalid time')
+            parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+            if (parsed.tzinfo is None or parsed<datetime(2000,1,1,tzinfo=timezone.utc)
+                    or parsed>datetime.now(timezone.utc)+timedelta(minutes=5)):
+                raise ValueError('Invalid time')
+            return parsed
+        try:
+            started=valid_time(actual_started_at,True)
+            ended=valid_time(actual_ended_at,True)
+            valid_time(observed_at)
+            if started is not None and ended is not None and ended<=started: return ''
+        except (ValueError,TypeError): return ''
+        with self.lock:
+            if not self.db.execute('SELECT 1 FROM rooms WHERE id=?',(room['id'],)).fetchone(): return ''
+            row=self.db.execute("""SELECT * FROM sessions WHERE room_id=? AND platform_session_id=?
+                ORDER BY (ended_at='') DESC,started_at DESC,id DESC LIMIT 1""",(room['id'],platform_session_id)).fetchone()
+            if row:
+                sid=row['id']
+                if not row['ended_at']: return sid
+                if actual_started_at and not row['actual_started_at']:
+                    if row['actual_ended_at'] and started>=valid_time(row['actual_ended_at']): return ''
+                    with self.db:
+                        self.db.execute('UPDATE sessions SET actual_started_at=?,started_at_source=? WHERE id=?',
+                                        (actual_started_at,'douyin.room.start_time',sid))
+                    self._csv(room,sid,'metadata_updated',observed_at,actual_started_at,row['started_at'],row['ended_at'],
+                              platform_session_id,'douyin.room.start_time',row['ended_at_source'],row['actual_ended_at'])
+            else:
+                sid=uuid.uuid4().hex
+                source='douyin.room.start_time' if actual_started_at else ''
+                with self.db:
+                    self.db.execute("""INSERT INTO sessions(id,room_id,started_at,ended_at,actual_started_at,
+                        platform_session_id,started_at_source) VALUES(?,?,?,?,?,?,?)""",
+                        (sid,room['id'],'',observed_at,actual_started_at,platform_session_id,source))
+                self._csv(room,sid,'discovered_offline',observed_at,actual_started_at,'',observed_at,
+                          platform_session_id,source,'observed_offline')
+            if actual_ended_at: self.update_session_end(room,sid,platform_session_id,actual_ended_at)
+            return sid
+    def get_pending_end_sessions(self,room_id):
+        """Closed broadcasts still missing the platform's actual finish time."""
+        with self.lock:
+            rows=self.db.execute("""SELECT * FROM sessions WHERE room_id=? AND ended_at<>''
+                AND (actual_ended_at='' OR actual_started_at='') AND length(platform_session_id) BETWEEN 1 AND 32
+                AND platform_session_id NOT GLOB '*[^0-9]*' ORDER BY ended_at DESC,id DESC LIMIT 100""",(room_id,)).fetchall()
+            return [dict(row) for row in rows]
+    def update_session_end(self,room,session_id,platform_session_id,actual_ended_at,ended_at_source='douyin.room.end_time'):
+        """Attach verified platform metadata without changing observation clocks.
+
+        A local session ID and platform session ID must both match a closed
+        broadcast. A new open broadcast for this room is never modified.
+        """
+        if (not isinstance(actual_ended_at,str) or not isinstance(ended_at_source,str)
+                or len(ended_at_source)>160 or not ended_at_source
+                or not isinstance(platform_session_id,str) or not re.fullmatch(r'[0-9]{1,32}',platform_session_id)):
+            return False
+        try:
+            ended=datetime.fromisoformat(actual_ended_at.replace('Z','+00:00'))
+            if (ended.tzinfo is None or ended<datetime(2000,1,1,tzinfo=timezone.utc)
+                    or ended>datetime.now(timezone.utc)+timedelta(minutes=5)): return False
+        except ValueError: return False
+        with self.lock:
+            row=self.db.execute("SELECT * FROM sessions WHERE id=? AND room_id=? AND platform_session_id=? AND ended_at<>''",
+                                (session_id,room['id'],platform_session_id)).fetchone()
+            if not row: return False
+            if row['actual_started_at']:
+                try:
+                    started=datetime.fromisoformat(row['actual_started_at'].replace('Z','+00:00'))
+                    if started.tzinfo is not None and ended<=started: return False
+                except ValueError: pass
+            if row['actual_ended_at']==actual_ended_at and row['ended_at_source']==ended_at_source: return False
+            with self.db:
+                self.db.execute('UPDATE sessions SET actual_ended_at=?,ended_at_source=? WHERE id=?',
+                                (actual_ended_at,ended_at_source,session_id))
+            self._csv(room,session_id,'metadata_updated',now_iso(),row['actual_started_at'],row['started_at'],row['ended_at'],
+                      platform_session_id,row['started_at_source'],ended_at_source,actual_ended_at)
+            return True
     def clear_untrusted_start(self,room):
         """Migrate a mistaken room-creation timestamp without fabricating an end."""
         with self.lock:
@@ -321,17 +428,17 @@ class Store:
             with self.db: self.db.execute('UPDATE sessions SET ended_at=? WHERE id=?',(at,row['id']))
             self._csv(room,row['id'],'end',at,row['actual_started_at'],row['started_at'],at,row['platform_session_id'],row['started_at_source'],reason)
             return True
-    def _csv(self,room,sid,event,at,actual_start,observed_start,observed_end,platform_id,start_source,end_source):
+    def _csv(self,room,sid,event,at,actual_start,observed_start,observed_end,platform_id,start_source,end_source,actual_end=''):
         directory=self.root/'time_begin_over'/room_directory(room)
         directory.mkdir(parents=True,exist_ok=True)
-        columns=['session_id','platform','room_id','nickname','event','observed_at','actual_started_at','observed_started_at','observed_ended_at','platform_session_id','started_at_source','ended_at_source']
+        columns=['session_id','platform','room_id','nickname','event','observed_at','actual_started_at','observed_started_at','observed_ended_at','platform_session_id','started_at_source','ended_at_source','actual_ended_at']
         path=directory/'events.csv'
         if path.exists() and path.stat().st_size:
             with path.open(encoding='utf-8-sig',newline='') as handle:
                 existing=next(csv.reader(handle),[])
             if existing!=columns:
                 # Keep old logs intact, including their original header semantics.
-                path=directory/'events_v2.csv'
+                path=directory/'events_v3.csv'
         empty=not path.exists() or not path.stat().st_size
         if not empty:
             with path.open(encoding='utf-8-sig',newline='') as handle:
@@ -340,7 +447,7 @@ class Store:
         with path.open('a',encoding='utf-8-sig',newline='') as handle:
             writer=csv.writer(handle)
             if empty: writer.writerow(columns)
-            values=[sid,room['platform'],room['room_input'],room['nickname'],event,at,actual_start,observed_start,observed_end,platform_id,start_source,end_source]
+            values=[sid,room['platform'],room['room_input'],room['nickname'],event,at,actual_start,observed_start,observed_end,platform_id,start_source,end_source,actual_end]
             writer.writerow(["'"+str(v) if str(v).startswith(('=','+','-','@')) else v for v in values])
     def close(self):
         with self.lock: self.db.close()

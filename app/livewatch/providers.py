@@ -216,7 +216,7 @@ def sanitize_probe_diagnostic(value):
             facts[key] = item
         elif key in ('access', 'page_access') and item in ('anonymous', 'authorized'):
             facts[key] = item
-        elif key == 'page_result' and item in ('failed', 'invalid', 'cooldown', 'skipped_network'):
+        elif key == 'page_result' and item in ('failed', 'invalid', 'cooldown', 'skipped_network', 'deferred'):
             facts[key] = item
     return ' '.join(f'{key}={facts[key]}' for key in sorted(facts))
 
@@ -1007,6 +1007,7 @@ class ProviderRegistry:
     # Sources which really require authorization report it at their own boundary.
     requires_auth = False
     adaptive_polling = True
+    paced_requests = True
     offline_confirmations = 2
     def __init__(self):
         self._local = threading.local()
@@ -1079,6 +1080,8 @@ class ProviderRegistry:
             platform = room.get('platform')
             if platform not in ('douyin', 'wechat'):
                 raise ProbeError('不支持的平台。')
+            if settings.get('_metadata_only'):
+                return self._session_metadata(room, settings)
             headers = validate_headers(room.get('request_headers') or {})
             if room.get('status_url'):
                 return self._status(room, headers, status_only=bool(settings.get('_status_only', False)))
@@ -1300,31 +1303,60 @@ class ProviderRegistry:
                     self._share_cache.pop(oldest, None)
         return kind, identifier, dict(metadata)
 
-    def _enrich_douyin(self, result):
-        """Fetch the current session's real start once; never replace its live state.
+    def _session_metadata(self, room, settings):
+        """Supplement an already confirmed broadcast without probing its status.
+
+        Only the coordinator's platform session ID selects the public reflow
+        request. Room URLs, supplied status/media endpoints and credentials are
+        never used here. Consumers must merge metadata only; this response is
+        not a new observation of the monitored room's current live state.
+        """
+        sid = settings.get('_metadata_session_id')
+        if (room.get('platform') != 'douyin' or room.get('status_url') or room.get('stream_url')
+                or not isinstance(sid, str) or not re.fullmatch(r'[0-9]{1,32}', sid)):
+            return ProbeResult(None, message='没有可补采开关播时间的平台场次。', error_code='metadata_unavailable')
+        ended = bool(settings.get('_metadata_ended'))
+        result = self._enrich_douyin(ProbeResult(not ended, live_session_id=sid), metadata_only=True)
+        if (result.live_ended_at or result.live_started_at if ended else result.live_started_at or result.avatar_url):
+            return result
+        # Accept metadata only from the expected state of the exact session.
+        # Empty, failed and mismatched responses are not status observations.
+        return ProbeResult(None, live_session_id=sid, message='平台暂未提供本场'+('下播' if ended else '开播')+'时间，稍后继续补采。',
+                           error_code=result.error_code or 'metadata_pending', retry_after=max(60, result.retry_after))
+
+    def _enrich_douyin(self, result, metadata_only=False):
+        """Fetch a session's real timestamps; never replace its observed live state.
 
         web-enter omits start_time on some rooms. The public mobile reflow API
-        provides it, but can also return stale sessions. Match both session ID
-        and live status before accepting metadata. No caller cookies or custom
+        provides it, but can also return stale sessions. An ended metadata-only
+        lookup requires that same session to be explicitly offline. Match both
+        ID and state before accepting metadata. No caller cookies or custom
         authorization headers are sent to the supplemental API.
         """
         sid = result.live_session_id
-        if result.live is not True or (result.live_started_at and start_time_priority(result.started_at_source) >= 3) or not sid:
+        ended = metadata_only and result.live is False
+        if (result.live is not True and not ended) or (result.live_started_at and start_time_priority(result.started_at_source) >= 3) or not sid:
             return result
+        # A broadcast's cached live metadata cannot satisfy an ended lookup.
+        cache_key = 'ended:' + sid if ended else sid
         now = time.monotonic()
         with self._metadata_lock:
-            cached = self._metadata_cache.get(sid)
-            cached_exact = bool(cached and cached['metadata'].get('live_started_at') and start_time_priority(cached['metadata'].get('started_at_source', '')) >= 3)
-            if cached and (cached_exact or now - cached['checked'] < 60):
+            cached = self._metadata_cache.get(cache_key)
+            cached_exact = bool(cached and (cached['metadata'].get('live_ended_at') and cached['metadata'].get('live_started_at') if ended else
+                cached['metadata'].get('live_started_at') and start_time_priority(cached['metadata'].get('started_at_source', '')) >= 3))
+            if cached and (cached_exact or now - cached['checked'] < max(60, cached.get('retry_after', 0))):
                 metadata = cached['metadata']
                 retry = False
+                if metadata_only:
+                    result.retry_after = max(0, math.ceil(cached['checked'] + cached.get('retry_after', 60) - now))
+                    result.error_code = cached.get('error_code', '')
             else:
                 metadata = {}
                 retry = True
-                self._metadata_cache[sid] = {'checked': now, 'metadata': {}}
+                self._metadata_cache[cache_key] = {'checked': now, 'metadata': {}}
                 if len(self._metadata_cache) > 512:
                     oldest = min(self._metadata_cache, key=lambda key: self._metadata_cache[key]['checked'])
-                    if oldest != sid:
+                    if oldest != cache_key:
                         self._metadata_cache.pop(oldest, None)
         if retry:
             params = urllib.parse.urlencode({'room_id': sid, 'type_id': '0', 'live_id': '1', 'app_id': '1128'})
@@ -1333,18 +1365,29 @@ class ProviderRegistry:
                                       {'Referer': 'https://live.douyin.com/', 'User-Agent': USER_AGENT}, opener=_anonymous_opener())
                 details = parse_douyin_data(_json(body))
                 if details.live_session_id == sid and details.live is result.live:
-                    metadata = {key: getattr(details, key) for key in ('live_started_at', 'started_at_source', 'avatar_url')}
+                    keys = ('live_started_at', 'started_at_source', 'live_ended_at') if ended else ('live_started_at', 'started_at_source', 'avatar_url')
+                    metadata = {key: getattr(details, key) for key in keys}
+                elif details.live is None and details.retry_after:
+                    raise ProbeError(details.message, details.error_code, details.retry_after)
                 with self._metadata_lock:
-                    self._metadata_cache[sid] = {'checked': now, 'metadata': metadata}
-            except ProbeError:
+                    self._metadata_cache[cache_key] = {'checked': now, 'metadata': metadata}
+            except ProbeError as exc:
                 # Failure leaves live status/stream intact, and does not fabricate
-                # a start time. Retry at most once per minute for this session.
-                pass
+                # a start time. Honor supplemental endpoint Retry-After too.
+                retry_after = max(60, exc.retry_after)
+                with self._metadata_lock:
+                    self._metadata_cache[cache_key] = {'checked': now, 'metadata': {},
+                                                'retry_after': retry_after, 'error_code': exc.code}
+                if metadata_only:
+                    result.retry_after = retry_after
+                    result.error_code = exc.code
         if metadata.get('live_started_at') and (not result.live_started_at or start_time_priority(metadata.get('started_at_source', '')) >= start_time_priority(result.started_at_source)):
             result.live_started_at = metadata['live_started_at']
             result.started_at_source = metadata.get('started_at_source', '')
         if not result.avatar_url:
             result.avatar_url = metadata.get('avatar_url', '')
+        if ended:
+            result.live_ended_at = metadata.get('live_ended_at', '')
         return result
 
     def _douyin(self, room, settings, headers):
@@ -1442,7 +1485,9 @@ class ProviderRegistry:
             page_not_before=settings.get('_status_page_not_before',0)
             if isinstance(page_not_before,bool) or not isinstance(page_not_before,(int,float)) or not math.isfinite(page_not_before): page_not_before=0
             result = self._douyin_anonymous(kind, identifier, expected_sec_uid, request_headers, monitor_opener, monitor_access,
-                                             status_only=status_only,status_page_not_before=page_not_before)
+                                             status_only=status_only,status_page_not_before=page_not_before,
+                                             single_request=bool(settings.get('_status_single_request')),
+                                             page_requested=bool(settings.get('_status_page_requested')))
             if result.live is None and result.error_code == 'platform_unavailable' and room.get('input_type', 'auto') == 'auto' and not raw.strip().startswith(('@', 'http://', 'https://')):
                 result.message += ' 若填写的是抖音账号，请选择“抖音账号”或在 ID 前加 @。'
             return result
@@ -1490,7 +1535,7 @@ class ProviderRegistry:
         deadline=getattr(_PROBE_CONTEXT,'deadline',None)
         return TIMEOUT if deadline is None else max(0,deadline-time.monotonic())
 
-    def _douyin_anonymous(self, kind, identifier, expected_sec_uid, request_headers, opener, access='anonymous', status_only=False,status_page_not_before=0):
+    def _douyin_anonymous(self, kind, identifier, expected_sec_uid, request_headers, opener, access='anonymous', status_only=False,status_page_not_before=0,single_request=False,page_requested=False):
         if status_only and kind != 'room':
             raise ProbeError('高频状态监控需要固定直播间地址或状态接口。', 'status_source_required', 300)
         page = None
@@ -1500,7 +1545,8 @@ class ProviderRegistry:
         generation = getattr(self._local, 'auth_generation', self._auth_generation)
         if access == 'authorized': _scope_monitor_room(opener, identifier if kind == 'room' else '')
         status_page_attempted=False
-        if status_only and self._status_page_needed(identifier,access,status_page_not_before):
+        if status_only and (self._status_page_needed(identifier,access,status_page_not_before) or
+                            page_requested and time.monotonic()>=status_page_not_before):
             with self._metadata_lock:
                 self._status_page_pending.discard(identifier)
                 self._page_attempts[identifier]=time.monotonic()+30
@@ -1510,6 +1556,7 @@ class ProviderRegistry:
             except ProbeError as exc:
                 raise ProbeError(str(exc),exc.code,exc.retry_after,exc.diagnostic+' stage=room_page') from None
             if result.live is not None or result.error_code=='target_mismatch': return result
+            if single_request: return result
             page_failure=_page_diagnostic(result.diagnostic,'invalid')
             if self._status_page_budget()<.75:
                 return result
@@ -1556,7 +1603,7 @@ class ProviderRegistry:
                 self._local.bootstrapped = True
                 page_failure = _page_diagnostic(exc.diagnostic, 'failed')
                 page_retry_after = exc.retry_after
-                if exc.code == 'network_error':
+                if exc.code in ('network_error','rate_limited','verification_required','auth_required'):
                     # DNS/connection failure to this host is shared by the API.
                     # Let the scheduler back off instead of making two more
                     # requests before it can observe this room's failure.
@@ -1589,6 +1636,16 @@ class ProviderRegistry:
             api_error = str(exc)
             api_error_code, api_retry_after = exc.code, exc.retry_after
             api_diagnostic = sanitize_probe_diagnostic(exc.diagnostic + ' stage=room_web_enter ' + api_body_facts + (' access=authorized' if access == 'authorized' else ''))
+        api_facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(api_diagnostic).split())
+        access_restricted=(api_error_code in ('rate_limited','verification_required') or
+                           api_facts.get('http') in ('401','403','429','444') or
+                           api_facts.get('body')=='verification' or int(api_facts.get('retry_after','0'))>0)
+        if access_restricted:
+            # Retrying via HTML after a rejection still hits the same platform.
+            # Return the restriction to the coordinator, including full-source
+            # probes, so its cooldown cannot be hidden by an older page body.
+            return _monitor_result(ProbeResult(None,message=api_error,error_code=api_error_code or 'platform_unavailable',
+                retry_after=api_retry_after,diagnostic=api_diagnostic),access)
         if status_only:
             # Empty compact responses can recover with a normal public page
             # which refreshes visitor cookies. Bound large-page traffic per room,
@@ -1601,7 +1658,17 @@ class ProviderRegistry:
                     self._status_page_pending.intersection_update(self._page_attempts)
             facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(api_diagnostic).split())
             server_retry=int(facts.get('retry_after','0'))
-            if not status_page_attempted and page_due and not server_retry:
+            restricted=(api_error_code in ('rate_limited','verification_required') or
+                        facts.get('http') in ('401','403','429','444') or facts.get('body')=='verification')
+            if not status_page_attempted and page_due and not server_retry and not restricted:
+                if single_request:
+                    # The next scheduler slot owns the fallback request. Carry
+                    # the hint through the parent so changing workers is safe.
+                    with self._metadata_lock:
+                        if len(self._status_page_pending)<2048: self._status_page_pending.add(identifier)
+                    return _monitor_result(ProbeResult(None,message=api_error,
+                        error_code=api_error_code or 'platform_unavailable',retry_after=max(api_retry_after,5),
+                        diagnostic=api_diagnostic+' page_result=deferred'),access)
                 if self._status_page_budget()<.75:
                     with self._metadata_lock:
                         if len(self._status_page_pending)<2048: self._status_page_pending.add(identifier)

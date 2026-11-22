@@ -10,6 +10,7 @@ import shutil
 import stat
 import threading
 import time
+from .media_options import recording_directory
 
 
 class Maintenance:
@@ -25,15 +26,26 @@ class Maintenance:
         path=Path(value)
         if not path.is_absolute(): path=self.root/path
         path=Path(os.path.abspath(path))
-        folder=self.root/('video' if kind=='recording' else 'logs')
-        try: relative=path.relative_to(folder)
-        except ValueError: raise ValueError('维护文件路径超出本应用输出目录') from None
+        folders=[self.root/('video' if kind=='recording' else 'logs')]
+        if kind=='recording':
+            settings=self.store.get_settings()
+            folders.append(recording_directory(self.root,settings))
+            folders.extend(recording_directory(self.root,settings,room) for room in self.store.list_rooms() if room.get('record_directory'))
+        folder=next((base for base in folders if path.is_relative_to(base)),None)
+        if folder is None and kind=='recording':
+            # Previously registered output remains owned after its configured
+            # directory changes. No directory scans or inferred ownership.
+            with self.store.lock:
+                owned=self.store.db.execute('SELECT 1 FROM owned_files WHERE path=? AND kind=?',(self._key(path),kind)).fetchone()
+            if owned: folder=path.parent
+        if folder is None: raise ValueError('维护文件路径超出本应用输出目录')
+        relative=path.relative_to(folder)
         if not relative.parts or ':' in str(relative) or '..' in relative.parts:
             raise ValueError('维护文件路径无效')
         # Never traverse symbolic links, Windows junctions, or other reparse
         # points, even when they resolve back inside the application directory.
-        current=self.root
-        for part in (folder.name,*relative.parts):
+        current=Path(path.anchor)
+        for part in path.parts[1:]:
             current=current/part
             try: info=current.lstat()
             except FileNotFoundError: continue
@@ -44,6 +56,10 @@ class Maintenance:
             raise ValueError('仅登记本应用生成的日志')
         return path
 
+    def _key(self,path):
+        try: return str(path.relative_to(self.root))
+        except ValueError: return str(path)
+
     @staticmethod
     def _identity(path):
         try: info=path.stat(follow_symlinks=False)
@@ -51,20 +67,38 @@ class Maintenance:
         if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1: raise ValueError('维护对象必须为普通单链接文件')
         return str(info.st_dev),str(info.st_ino),info.st_size,str(info.st_mtime_ns)
 
-    def _register(self,path,kind,active,process_id):
+    def _register(self,path,kind,active,process_id,previous_segment=None):
         if type(active) is not bool or process_id is not None and (type(process_id) is not int or process_id<=0):
             raise ValueError('文件登记状态无效')
         with self.lock:
-            path=self._path(path,kind)
+            try: path=self._path(path,kind)
+            except ValueError:
+                # A running recording may finish a segment just after the
+                # user changes its destination. Only its exact next numbered
+                # segment can inherit ownership from the previous segment.
+                if kind!='recording' or previous_segment is None: raise
+                prior=self._path(previous_segment,kind)
+                match=re.fullmatch(r'(.+)_([0-9]{6})\.ts',prior.name)
+                path=Path(os.path.abspath(path))
+                if not match or path!=prior.with_name(f'{match[1]}_{int(match[2])+1:06d}.ts'): raise
+                with self.store.lock:
+                    owned=self.store.db.execute('SELECT process_id FROM owned_files WHERE path=? AND kind=?',(self._key(prior),kind)).fetchone()
+                if owned is None or process_id is None or owned[0]!=process_id: raise
+                # Reuse the already validated component chain; the new final
+                # component still must be an ordinary single-link file.
+                try:
+                    info=path.lstat()
+                    if stat.S_ISLNK(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400: raise ValueError('录制文件路径发生跳转')
+                except FileNotFoundError: pass
             identity=self._identity(path)
             stamp=time.time()
             with self.store.lock,self.store.db:
                 self.store.db.execute('INSERT OR REPLACE INTO owned_files VALUES(?,?,?,?,?,?,?,?,?,?)',
-                    (str(path.relative_to(self.root)),kind,int(active),stamp,None if active else stamp,process_id,*identity))
+                    (self._key(path),kind,int(active),stamp,None if active else stamp,process_id,*identity))
             return str(path)
 
-    def register_recording(self,path,active=True,process_id=None):
-        return self._register(path,'recording',active,process_id)
+    def register_recording(self,path,active=True,process_id=None,previous_segment=None):
+        return self._register(path,'recording',active,process_id,previous_segment)
 
     def register_log(self,path,active=True,process_id=None):
         return self._register(path,'log',active,process_id)
@@ -73,7 +107,7 @@ class Maintenance:
         with self.lock:
             path=self._path(path,kind)
             identity=self._identity(path)
-            relative=str(path.relative_to(self.root))
+            relative=self._key(path)
             with self.store.lock,self.store.db:
                 previous=self.store.db.execute('SELECT * FROM owned_files WHERE path=? AND kind=?',(relative,kind)).fetchone()
                 if previous is None: return False
@@ -136,15 +170,18 @@ class Maintenance:
                 except (OSError,ValueError): pass
         return released
 
-    def disk_status(self,settings=None):
+    def disk_status(self,settings=None,room=None,path=None):
         settings=self.store.get_settings() if settings is None else settings
         minimum=settings.get('min_free_disk_gib',2)
         if type(minimum) not in (int,float) or not math.isfinite(minimum) or minimum<0: minimum=2
         min_bytes=int(minimum*1024**3)
         try:
-            folder=self._path(self.root/'video'/'.disk-check','recording').parent
+            folder=Path(path).parent if path else recording_directory(self.root,settings,room)
+            # A newly selected directory may not exist yet. Measure its nearest
+            # existing ancestor on the same volume before creating output.
+            while not folder.exists() and folder!=folder.parent: folder=folder.parent
             free=shutil.disk_usage(folder).free
-            return dict(free_bytes=free,min_free_bytes=min_bytes,recording_allowed=free>=min_bytes,error='')
+            return dict(free_bytes=free,min_free_bytes=min_bytes,recording_allowed=free>=min_bytes,error='',directory=str(folder))
         except (OSError,ValueError):
             return dict(free_bytes=None,min_free_bytes=min_bytes,recording_allowed=False,error='无法读取录制磁盘的剩余空间')
 

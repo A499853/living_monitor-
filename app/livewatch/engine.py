@@ -30,6 +30,19 @@ class Engine:
             self.pool.configure(store.get_settings())
         else:
             self.pool=concurrent.futures.ThreadPoolExecutor(max_workers=64,thread_name_prefix='probe')
+        # Slow start-time lookups have their own small pool and deadline. They
+        # never occupy a status worker or change a room's live confirmation.
+        if isolated_probes:
+            self.metadata_pool=ProbePool(providers,max_workers=2)
+            self.metadata_pool.configure(initial_settings)
+        else:
+            self.metadata_pool=concurrent.futures.ThreadPoolExecutor(max_workers=2,thread_name_prefix='start-time')
+        self.metadata_pending={}
+        self.discarded_metadata=set()
+        self.metadata_last_submitted=None
+        self.metadata_blocked_until=0
+        self.end_metadata_jobs={}
+        self._metadata_eligible={}
         self.states={}
         self.pending={}
         self.recoveries={}
@@ -59,6 +72,13 @@ class Engine:
         self.douyin_rejections={}
         self.douyin_network_failures={}
         self.douyin_recovery_successes=0
+        self.douyin_next_request_at=0
+        self.douyin_backoff_level=0
+        self.douyin_empty_failures={}
+        self.douyin_healthy_since=None
+        self.douyin_pacing_successes=0
+        self.douyin_session_rebuilds=0
+        self.douyin_last_rebuild_at=None
         self.round_queue=[]
         self.round_active=False
         self.round_number=0
@@ -83,6 +103,7 @@ class Engine:
             observed=previous.get('observed_started_at','') or (previous.get('live_started_at','') if migrated else '')
             self.states[rid]=dict(live_status='checking' if room['monitor_enabled'] else 'disabled',record_status='recorded' if previous.get('duration_seconds',0)>0 else 'idle',last_checked='',live_started_at=actual,observed_started_at=observed,started_at_source='' if migrated or created_time else previous.get('started_at_source',''),live_session_id=previous.get('live_session_id',''),avatar_url=previous.get('avatar_url',''),live_ended_at=previous.get('live_ended_at',''),duration_seconds=previous.get('duration_seconds',0),last_error='',resolved_stream_url='',stream_variants=[],resolved_room_input='',confirmed_live=previous.get('confirmed_live',None),retry_at=0,record_path=previous.get('record_path',''),record_headers={},source_identity=self._identity(room),source_room=dict(room),error_code='',error_diagnostic='',failure_count=0)
             self.states[rid]['platform_ended_at']=previous.get('platform_ended_at','')
+            self.states[rid]['last_ended_session_id']=previous.get('last_ended_session_id','')
             task=self.store.get_record_task(rid) if hasattr(self.store,'get_record_task') else {}
             self.states[rid].update(last_media_at=task.get('last_media_write_at') or previous.get('last_media_at',''),
                                     record_task_id=task.get('task_id') or previous.get('record_task_id',''),
@@ -100,7 +121,15 @@ class Engine:
                                     _persisted_success_at=previous.get('last_success_at',''))
             self.states[rid].update(last_check_finished_at='',last_actual_check_interval_seconds=None,
                                     detection_uncertain=True,offline_checks=0)
+            self._queue_end_metadata(room)
         return self.states[rid]
+
+    def _queue_end_metadata(self,room):
+        if room['platform']!='douyin' or room.get('status_url') or room.get('stream_url'): return
+        if not hasattr(self.store,'get_pending_end_sessions'): return
+        for session in self.store.get_pending_end_sessions(room['id']):
+            if session['id'] not in self.end_metadata_jobs:
+                self.end_metadata_jobs[session['id']]=dict(session,identity=self._identity(room),next_at=0)
     @staticmethod
     def _actual_time(value):
         # Treat provider metadata as a time only when it is timezone-aware and
@@ -153,12 +182,27 @@ class Engine:
                     wake_times=[self._status_due_at(rid,settings) for rid,state in self.states.items()
                                 if state['source_room']['monitor_enabled'] and rid not in self.pending and rid not in self.recoveries]
                     wake_times.extend(rescue['next_at'] for rid,rescue in self.recoveries.items() if rid not in self.pending)
+                    # A fleet's first wave is limited by the shared one-second
+                    # budget, not by any room timer. Wake exactly when its next
+                    # slot opens; fixed 200 ms polling otherwise adds drift at
+                    # every rate-limited wave and can delay untouched rooms.
+                    if self.rate_window and not self._request_budget_available(settings,now):
+                        wake_times.append(self.rate_window[0]+1)
+                    if self.douyin_next_request_at>now:
+                        wake_times.append(self.douyin_next_request_at)
                     future=[at-now for at in wake_times if at>now]
                 self.wake.wait(min(.2,min(future)) if future else .2); self.wake.clear()
                 continue
             until_next=self._next_dispatch_at(settings)-time.monotonic()
             self.wake.wait(min(.4,until_next) if until_next>0 else .4); self.wake.clear()
     def _tick(self):
+        with self.lock:
+            self._tick_checks()
+            if self.stop_event.is_set(): return
+            settings=self.store.get_settings()
+            self._tick_metadata(self._metadata_eligible,settings,time.monotonic())
+
+    def _tick_checks(self):
         with self.lock:
             if self.stop_event.is_set(): return
             self._drain_record_stops()
@@ -182,6 +226,7 @@ class Engine:
                 if not room['monitor_enabled']:
                     self._cancel_recovery(rid)
                     if rid in self.pending: self.discarded_probes.add(self.pending[rid][0])
+                    if rid in self.metadata_pending: self.discarded_metadata.add(self.metadata_pending[rid][0])
                     state['live_status']='disabled'
                     self._stop_record(rid,room)
                     continue
@@ -200,8 +245,13 @@ class Engine:
                         state.update(live_status='error',error_code='auth_required',error_diagnostic='',last_error='请先在软件中登录抖音并完成授权')
                         continue
                 eligible[rid]=room
+            self._metadata_eligible=eligible
             now=time.monotonic()
             self._expire_recoveries(now)
+            # Use freshly validated rooms for this turn. Give metadata one
+            # opportunity every five seconds so status traffic cannot starve it.
+            if getattr(self.providers,'paced_requests',False) and (self.metadata_last_submitted is None or now-self.metadata_last_submitted>=5):
+                self._tick_metadata(eligible,settings,now)
             if settings.get('status_only_mode',True):
                 self._tick_status(eligible,settings,now)
                 return
@@ -289,6 +339,7 @@ class Engine:
         self.status_last_started[room['id']]=submitted_at
         self.probe_started_times.append(submitted_at)
         self.rate_window.append(submitted_at)
+        if self._paced_room(room): self._reserve_douyin_request(submitted_at)
         state['last_attempt_at']=now_iso()
 
     def _probe_settings(self,room,settings,deadline):
@@ -297,6 +348,8 @@ class Engine:
         state['source_refreshing']=refresh
         return dict(settings,_probe_deadline=deadline,
                     _status_page_not_before=state.get('_status_page_not_before',0),
+                    _status_page_requested=state.get('_status_page_requested',False),
+                    _status_single_request=True,
                     _status_only=bool(settings.get('status_only_mode',True)) and not refresh)
 
     def _tick_status(self,eligible,settings,now):
@@ -347,6 +400,141 @@ class Engine:
         return max(1,min(16,int(settings.get('monitor_batch_size',3))))
 
     @staticmethod
+    def _needs_start_metadata(room,state):
+        return bool(room['monitor_enabled'] and room['platform']=='douyin'
+                    and not room.get('status_url') and not room.get('stream_url')
+                    and state.get('confirmed_live') is True
+                    and re.fullmatch(r'[0-9]{1,32}',state.get('live_session_id',''))
+                    and (not state.get('live_started_at') or start_time_priority(state.get('started_at_source'))<3))
+
+    @staticmethod
+    def _metadata_session_key(state):
+        return (state.get('live_session_id',''),state.get('observed_started_at',''))
+
+    def _tick_metadata(self,eligible,settings,now):
+        # Status dispatch above has first use of the global request budget.
+        # At most two supplemental requests run, with one new lookup per second.
+        if len(self.metadata_pending)>=2 or now<max(self.douyin_blocked_until,self.metadata_blocked_until) or self.douyin_recovery_rid: return
+        if self.metadata_last_submitted is not None and now-self.metadata_last_submitted<1: return
+        if not self._request_budget_available(settings,now): return
+        if getattr(self.providers,'paced_requests',False) and not self._platform_slot_available(settings): return
+        candidates=[]
+        for session_id,job in list(self.end_metadata_jobs.items()):
+            room=eligible.get(job['room_id'])
+            if room is None:
+                # Keep disabled rooms' history in SQLite for later resumption.
+                if job['room_id'] not in self.states: self.end_metadata_jobs.pop(session_id,None)
+                continue
+            if job['identity']!=self._identity(room):
+                self.end_metadata_jobs.pop(session_id,None)
+                continue
+            if room['id'] in self.metadata_pending or now<job['next_at']: continue
+            candidates.append((job['next_at'],room['sort_order'],room['id'],(job['platform_session_id'],job['started_at']),session_id))
+        for rid,room in eligible.items():
+            state=self._state(room)
+            if not self._needs_start_metadata(room,state) or rid in self.metadata_pending: continue
+            if state.get('detection_uncertain') or state.get('offline_checks') or rid in self.recoveries: continue
+            key=self._metadata_session_key(state)
+            next_at=state.get('_metadata_next_at',0) if state.get('_metadata_session_key')==key else 0
+            if now>=next_at: candidates.append((next_at,room['sort_order'],rid,key,''))
+        if not candidates: return
+        _,_,rid,key,ended_session=min(candidates)
+        room=eligible[rid]; state=self._state(room)
+        if ended_session:
+            self.end_metadata_jobs[ended_session]['next_at']=now+60
+        else:
+            state['_metadata_session_key']=key
+            state['_metadata_next_at']=now+60
+        probe_settings=dict(settings,_metadata_only=True,_metadata_session_id=key[0],
+                            _metadata_ended=bool(ended_session),_status_only=False,_probe_deadline=now+8)
+        future=self.metadata_pool.submit(self.providers.check,dict(room),probe_settings)
+        self.metadata_pending[rid]=(future,self._identity(room),self.auth_generation,key,ended_session)
+        self.metadata_last_submitted=now
+        self.rate_window.append(now)
+        if self._paced_room(room): self._reserve_douyin_request(now)
+        self.probe_started_times.append(now)
+        future.add_done_callback(lambda f,r=rid:self._metadata_finished(r,f))
+
+    def _metadata_finished(self,rid,future):
+        with self.lock:
+            submitted=self.metadata_pending.get(rid)
+            if submitted is None or submitted[0] is not future: return
+            self.metadata_pending.pop(rid)
+            self.wake.set()
+            if future in self.discarded_metadata:
+                self.discarded_metadata.discard(future)
+                return
+            if self.stop_event.is_set(): return
+            try: room=self.store.get_room(rid)
+            except ValueError: return
+            state=self._state(room)
+            if len(submitted)>4 and submitted[4]:
+                self._end_metadata_finished(room,state,submitted,future)
+                return
+            if (not self._needs_start_metadata(room,state) or submitted[1]!=self._identity(room)
+                    or submitted[2]!=self.auth_generation or submitted[3]!=self._metadata_session_key(state)):
+                return
+            # Retry from completion, even after an exception or empty platform
+            # response. Keep status freshness, source and recording untouched.
+            state['_metadata_next_at']=time.monotonic()+60
+            try: result=future.result()
+            except Exception: return
+            retry=self._retry_delay(getattr(result,'retry_after',0))
+            state['_metadata_next_at']=time.monotonic()+max(60,retry)
+            if getattr(result,'error_code','') in ('rate_limited','auth_required','verification_required') or retry>60:
+                self.metadata_blocked_until=max(self.metadata_blocked_until,state['_metadata_next_at'])
+            if result.live is not True or result.live_session_id!=state['live_session_id']: return
+            actual=self._actual_time(getattr(result,'live_started_at',''))
+            source=str(getattr(result,'started_at_source','') or '')[:160]
+            if actual and start_time_priority(source)>0:
+                if not state['live_started_at'] or start_time_priority(source)>=start_time_priority(state['started_at_source']):
+                    changed=(actual,source)!=(state['live_started_at'],state['started_at_source'])
+                    state.update(live_started_at=actual,started_at_source=source)
+                    if changed:
+                        # A delayed lookup may update an open broadcast only;
+                        # it cannot reopen a session closed by a status check.
+                        if self.store.get_open_session(rid):
+                            self.store.open_session(room,state['observed_started_at'],actual,state['live_session_id'],source)
+                        self.store.append_event('live_start_metadata',room,'已补充本场开播时间'+('（根据平台本场时长推算）' if '推算' in source else '（平台时间）'))
+            avatar=getattr(result,'avatar_url','')
+            if isinstance(avatar,str) and avatar.startswith(('http://','https://')) and not state.get('avatar_url'):
+                state['avatar_url']=avatar
+            self._persist(rid,state)
+
+    def _end_metadata_finished(self,room,state,submitted,future):
+        session_id=submitted[4]
+        job=self.end_metadata_jobs.get(session_id)
+        if (not job or not room['monitor_enabled'] or submitted[1]!=self._identity(room)
+                or submitted[2]!=self.auth_generation or job['identity']!=self._identity(room)): return
+        job['next_at']=time.monotonic()+60
+        try: result=future.result()
+        except Exception: return
+        retry=self._retry_delay(getattr(result,'retry_after',0))
+        job['next_at']=time.monotonic()+max(60,retry)
+        if getattr(result,'error_code','') in ('rate_limited','auth_required','verification_required') or retry>60:
+            self.metadata_blocked_until=max(self.metadata_blocked_until,job['next_at'])
+        if result.live is not False or result.live_session_id!=job['platform_session_id']: return
+        actual=self._actual_time(getattr(result,'live_started_at',''))
+        source=str(getattr(result,'started_at_source','') or '')[:160]
+        if actual and start_time_priority(source)>0:
+            self.store.discover_ended_session(room,job['platform_session_id'],actual,observed_at=job['ended_at'])
+        if actual and start_time_priority(source)>0 and state['confirmed_live'] is False and state['live_session_id']==job['platform_session_id']:
+            if not state['live_started_at'] or start_time_priority(source)>=start_time_priority(state['started_at_source']):
+                state.update(live_started_at=actual,started_at_source=source)
+                self._persist(room['id'],state)
+        ended=self._actual_time(getattr(result,'live_ended_at',''))
+        if not ended: return
+        changed=self.store.update_session_end(room,session_id,job['platform_session_id'],ended)
+        missing=self.store.get_pending_end_sessions(room['id'])
+        if not any(session['id']==session_id for session in missing): self.end_metadata_jobs.pop(session_id,None)
+        if changed:
+            if (state.get('last_ended_session_id')==session_id or
+                    not state.get('last_ended_session_id') and state['confirmed_live'] is False and state['live_session_id']==job['platform_session_id']):
+                state['platform_ended_at']=ended
+                self._persist(room['id'],state)
+            self.store.append_event('live_end_metadata',room,'已补充本场抖音下播时间（平台时间）')
+
+    @staticmethod
     def _probe_timeout(settings,room):
         if settings.get('status_only_mode',True):
             # Status-only probes have no reason to wait for a page or media
@@ -358,8 +546,40 @@ class Engine:
         # Submitted source identities survive deletion or edits, so an obsolete
         # official request keeps consuming the platform's real request budget.
         active=sum(identity[0]=='douyin' and not identity[3] and not identity[4] for _,identity,*_ in self.pending.values())
-        limit=settings.get('status_douyin_concurrency',32) if settings.get('status_only_mode',True) else settings.get('monitor_douyin_concurrency',2)
+        limit=settings.get('status_douyin_concurrency',4) if settings.get('status_only_mode',True) else settings.get('monitor_douyin_concurrency',2)
+        if getattr(self.providers,'paced_requests',False):
+            if time.monotonic()<self.douyin_next_request_at: return False
+            active+=len(self.metadata_pending)
+            limit=max(1,int(limit)//(2**self.douyin_backoff_level))
         return active<min(self._effective_concurrency(settings),limit)
+    def _paced_room(self,room):
+        return self._adaptive_room(room) and bool(getattr(self.providers,'paced_requests',False))
+    def _douyin_request_rate(self,settings):
+        return max(.2,min(20,float(settings.get('monitor_douyin_requests_per_second',2)))/(2**self.douyin_backoff_level))
+    def _reserve_douyin_request(self,now):
+        # No accumulated tokens: a long pause can never create a burst.
+        self.douyin_next_request_at=now+1/self._douyin_request_rate(self.store.get_settings())
+    def _degrade_douyin(self,room,now,cooldown,reason):
+        newly_blocked=not self.douyin_blocked_until or now>=self.douyin_blocked_until
+        if newly_blocked:
+            self.douyin_backoff_level=min(4,self.douyin_backoff_level+1)
+            self.store.append_event('monitor_backoff',room,reason+'，降低检查速率，冷却后逐个试探恢复。')
+        self.douyin_healthy_since=None
+        self.douyin_pacing_successes=0
+        self.douyin_recovery_successes=0
+        self.douyin_blocked_until=max(self.douyin_blocked_until,now+cooldown)
+        self.metadata_blocked_until=max(self.metadata_blocked_until,self.douyin_blocked_until)
+        # Rebuild transport state only after repeated shared failures, with a
+        # ten-minute guard. Room confirmations, sessions and recording survive.
+        if newly_blocked and self.douyin_backoff_level>=2 and (self.douyin_last_rebuild_at is None or now-self.douyin_last_rebuild_at>=600):
+            reset=getattr(self.providers,'reset_session',None)
+            if reset: reset(self.store.get_settings())
+            for pool in (self.pool,self.metadata_pool):
+                rebuild=getattr(pool,'rebuild_sessions',None)
+                if rebuild: rebuild()
+            self.douyin_session_rebuilds+=1
+            self.douyin_last_rebuild_at=now
+            self.store.append_event('monitor_rebuilt',room,'持续异常，已重建监控连接和访客会话；保留直播场次、授权和录制任务，冷却后重新检查。')
     def _fresh_checks_waiting(self,eligible,settings,now):
         if settings.get('status_only_mode',True):
             return any(rid not in self.pending and rid not in self.recoveries
@@ -449,10 +669,12 @@ class Engine:
                 code='network_error' if isinstance(exc,(OSError,TimeoutError)) else ''
                 self._handle_probe_error(room,state,'检查失败：'+safe_message(exc),code); return
             result_facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(getattr(result,'diagnostic','')).split())
+            if result_facts.get('page_result')=='deferred': state['_status_page_requested']=True
             if (result_facts.get('stage')=='room_page' or result_facts.get('page_stage')=='room_page') and result_facts.get('page_result')!='cooldown':
                 # The room's page budget belongs to the coordinator, so a new
                 # pooled worker cannot bypass an earlier worker's refresh wait.
                 state['_status_page_not_before']=time.monotonic()+30
+                state['_status_page_requested']=False
             # Nickname and avatar are room metadata, also useful while offline.
             if result.nickname and result.nickname!=room['nickname']:
                 room=self.store.update_room(rid,{'nickname':str(result.nickname)[:160]})
@@ -476,13 +698,23 @@ class Engine:
             if self._adaptive_room(room):
                 self.douyin_rejections.pop(rid,None)
                 self.douyin_network_failures.pop(rid,None)
+                self.douyin_empty_failures.pop(rid,None)
+                if self._paced_room(room) and self.douyin_backoff_level and not self.douyin_blocked_until:
+                    if self.douyin_healthy_since is None: self.douyin_healthy_since=time.monotonic()
+                    self.douyin_pacing_successes+=1
+                    if self.douyin_pacing_successes>=10 and time.monotonic()-self.douyin_healthy_since>=60:
+                        self.douyin_backoff_level-=1
+                        self.douyin_pacing_successes=0
+                        self.douyin_healthy_since=time.monotonic()
+                        self.store.append_event('monitor_ramp_up',room,'监控持续稳定，逐级提高检查速率。')
                 if recovering:
                     self.douyin_recovery_successes+=1
                     if self.douyin_recovery_successes>=2:
                         self.douyin_blocked_until=0
                         self.douyin_rejections.clear()
                         self.douyin_network_failures.clear()
-                        self.store.append_event('monitor_recovered',room,'连续两次试探检查成功，恢复设定的每批检查数量。')
+                        self.douyin_empty_failures.clear()
+                        self.store.append_event('monitor_recovered',room,'连续两次试探检查成功，恢复检查；持续稳定后逐级提高速率。')
                     else:
                         self.douyin_blocked_until=max(self.douyin_blocked_until,time.monotonic()+5)
                 success_retry=max(int(result_facts.get('retry_after','0')),int(result_facts.get('page_retry_after','0')))
@@ -528,7 +760,6 @@ class Engine:
             if start_time_priority(source)==0:
                 actual=''; source=''
             if result.live:
-                state['platform_ended_at']=''
                 previous_id=state['live_session_id']
                 # A changed platform room/session ID proves a new broadcast even
                 # when the app was closed throughout the offline interval.
@@ -538,10 +769,11 @@ class Engine:
                 if changed:
                     self._stop_record(rid,room)
                     self.store.close_session(room,at,reason='observed_session_changed')
+                    self._queue_end_metadata(room)
                     self.store.append_event('live_session_changed',room,'检测到新的直播场次；上一场结束时刻未由平台提供')
                 if old is not True or changed:
                     if (old is False or changed) and hasattr(self.store,'promote_room'): self.store.promote_room(rid)
-                    state.update(live_started_at=actual,observed_started_at=at,started_at_source=source,live_session_id=platform_id,live_ended_at='',retry_at=0)
+                    state.update(live_started_at=actual,observed_started_at=at,started_at_source=source,live_session_id=platform_id,retry_at=0)
                     self.store.open_session(room,at,actual,platform_id,source)
                     self.store.append_event('live_started',room,'监测到开播'+('，已取得平台开播时间' if actual else '，平台尚未提供真实开播时间'))
                     self._sound()
@@ -557,18 +789,36 @@ class Engine:
                 if room['record_enabled']: self._start_record(room,state)
             else:
                 ended=self._actual_time(getattr(result,'live_ended_at',''))
-                if ended: state['platform_ended_at']=ended
+                initial_offline=old is not True and bool(platform_id) and (not state['live_session_id'] or state['live_session_id']!=platform_id)
+                if not initial_offline and platform_id and state['live_session_id'] and platform_id!=state['live_session_id']: ended=''
                 self._stop_record(rid,room)
                 if state['duration_seconds']>0: state['record_status']='recorded'
                 if old is True:
+                    session=self.store.get_open_session(rid)
                     state['live_ended_at']=at
+                    state['platform_ended_at']=''
+                    state['last_ended_session_id']=session['id'] if session else ''
                     self.store.close_session(room,at)
                     self.store.append_event('live_ended',room,'监测到下播（本机检测时间）')
+                elif initial_offline:
+                    session_id=self.store.discover_ended_session(room,platform_id,actual,ended,at)
+                    if session_id:
+                        state.update(live_session_id=platform_id,live_started_at=actual,started_at_source=source,
+                                     observed_started_at='',last_ended_session_id=session_id,platform_ended_at=ended,live_ended_at='')
+                        self._queue_end_metadata(room)
+                if ended and state.get('live_ended_at'): state['platform_ended_at']=ended
+                if old is True: self._queue_end_metadata(room)
+                if ended and state.get('live_session_id'):
+                    for session_id,job in list(self.end_metadata_jobs.items()):
+                        if job['room_id']==rid and job['platform_session_id']==state['live_session_id']:
+                            if self.store.update_session_end(room,session_id,job['platform_session_id'],ended):
+                                self.end_metadata_jobs.pop(session_id,None)
             self._persist(rid,state)
     def _persist(self,rid,state):
         payload={k:state[k] for k in ['confirmed_live','live_started_at','observed_started_at','started_at_source','live_session_id','avatar_url','live_ended_at','duration_seconds','record_path']}
         payload['runtime_version']=2
         payload['platform_ended_at']=state.get('platform_ended_at','')
+        payload['last_ended_session_id']=state.get('last_ended_session_id','')
         payload.update({key:state.get(key) for key in ('last_media_at','record_task_id','record_recovery_count')})
         now=time.monotonic()
         # Persist freshness on a state change, a minute checkpoint, or graceful
@@ -594,6 +844,16 @@ class Engine:
         state['detection_uncertain']=True
         state['offline_checks']=0
         state.pop('_offline_recheck_at',None)
+        facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(diagnostic).split())
+        empty_response=(error_code in ('anonymous_restricted','platform_unavailable') and
+                        (facts.get('body') in ('empty','missing_room') or facts.get('platform_status')=='30003'))
+        # An empty platform reply is ambiguous, but repeating it immediately
+        # across the fleet amplifies traffic. Network resets keep a small rescue
+        # window; empty replies use the normal paced, progressive retry path.
+        if self._paced_room(room) and empty_response:
+            self.recoveries.pop(rid,None)
+            self._probe_error(room,state,message,error_code,retry_after,diagnostic)
+            return
         rescue=self.recoveries.get(rid)
         if state['live_status']!='error' and self._transient_error(error_code,diagnostic):
             if rescue is None:
@@ -602,7 +862,7 @@ class Engine:
                 detail=sanitize_probe_diagnostic(diagnostic)
                 self.store.append_event('probe_retrying',room,'检测异常，正在快速恢复 [code='+('network_error' if error_code=='network_error' else 'transient')+(' '+detail if detail else '')+']')
             else:
-                rescue['next_at']=now+2
+                rescue['next_at']=now+min(5,2**min(rescue['attempts'],3))
             rescue['error']=(message,error_code,retry_after,sanitize_probe_diagnostic(diagnostic))
             state['status_note']='连接暂时不稳，正在 10 秒内自动补查；当前保留上次确认的状态'
             state['offline_checks']=0
@@ -643,6 +903,7 @@ class Engine:
             # Leave capacity for fresh rooms during a wave of transient errors.
             if independent and self.max_concurrent_checks>1 and any(key in self.recoveries for key in self.pending) and self._fresh_checks_waiting(eligible,settings,now): break
             if rid not in eligible or rid in self.pending or now<rescue['next_at']: continue
+            if rescue['attempts']>=2: continue
             room=eligible[rid]
             if self._adaptive_room(room):
                 if now<self.douyin_blocked_until or self.douyin_recovery_rid or not self._platform_slot_available(settings): continue
@@ -696,9 +957,19 @@ class Engine:
                 # second library hints must not become a fleet-wide cooldown
                 # after the short rescue window ends.
                 explicit=max(server_retry,0 if transient or network_failure else self._retry_delay(retry_after))
-                state['_error_recheck_at']=now+min(5,self.store.get_settings().get('status_poll_interval_seconds',8))
+                delay=min(5,self.store.get_settings().get('status_poll_interval_seconds',8))
+                if self._paced_room(room):
+                    delay=min(60,5*2**min(state['failure_count']-1,4))
+                    delay+=int(hashlib.sha256(room['id'].encode()).hexdigest()[:4],16)%1000/1000
+                    empty=(facts.get('body') in ('empty','missing_room') or facts.get('platform_status')=='30003')
+                    if empty:
+                        self.douyin_empty_failures={key:at for key,at in self.douyin_empty_failures.items() if now-at<30}
+                        self.douyin_empty_failures[room['id']]=now
+                        if len(self.douyin_empty_failures)>=3 or self.douyin_blocked_until:
+                            self._degrade_douyin(room,now,max(15,server_retry),'多个直播间短时间返回空数据，可能为平台限制或接口异常')
+                state['_error_recheck_at']=now+delay
                 self.due[room['id']]=now+explicit
-                state['status_note']='检测尚未恢复，继续独立重试'
+                state['status_note']='检测尚未恢复，已错开并降低重试频率'
                 return
             # Respect server Retry-After; otherwise retry a first restriction
             # promptly and progressively back off repeated restrictions.
@@ -719,6 +990,10 @@ class Engine:
             widespread=restricted and len(self.douyin_rejections)>=3 or network_failure and len(self.douyin_network_failures)>=3
             if widespread or self.douyin_blocked_until:
                 cooldown=max(30 if network_failure else min(120,delay),self._retry_delay(retry_after))
+                if self._paced_room(room):
+                    reason='多个直播间连续网络连接失败' if network_failure else '多个直播间连续受到平台访问限制'
+                    self._degrade_douyin(room,now,cooldown,reason)
+                    return
                 if not self.douyin_blocked_until:
                     reason='多个直播间连续网络连接失败' if network_failure else '多个直播间连续受到平台访问限制'
                     self.store.append_event('monitor_backoff',room,reason+'，暂缓抖音检查，稍后以单房间试探恢复。')
@@ -738,16 +1013,16 @@ class Engine:
         rid=room['id']; settings=self.store.get_settings()
         if rid in self.record_stop_tasks: return
         status=self.recorder.status(rid)
-        selection=(room.get('record_quality',''),room.get('record_protocol',''))
+        selection=(room.get('record_quality',''),room.get('record_protocol',''),room.get('record_directory') or settings.get('recording_directory',''))
         if status and status['running']:
             if selection!=state.get('_record_selection',selection):
                 self._queue_record_stop(rid,room,report_saved=True)
                 state.update(record_status='recovering',record_needs_source=True,record_recheck_at=time.monotonic(),retry_at=0)
-                self.store.append_event('record_source_changed',room,'录制画质或格式已更改，重新取源后创建新片段')
+                self.store.append_event('record_source_changed',room,'录制画质、格式或目录已更改，重新取源后创建新片段')
             return
         if state.get('record_needs_source'): return
         if time.monotonic()<state['retry_at']: return
-        disk=self.maintenance.disk_status(settings)
+        disk=self.maintenance.disk_status(settings,room=room)
         self.maintenance_status['disk']=disk
         if not disk['recording_allowed']:
             state['record_status']='queued'; state['last_error']=disk['error'] or '磁盘剩余空间低于保护阈值，已暂停录制；监控继续'
@@ -759,7 +1034,7 @@ class Engine:
         if not state['resolved_stream_url']:
             self._record_failure(room,state,'直播已开播，但尚未解析到可录制的直播源'); return
         source=state['resolved_stream_url']
-        if any(selection):
+        if any(selection[:2]):
             variants=state.get('stream_variants',[])
             chosen=next((item for item in variants if (not selection[0] or item.get('quality')==selection[0]) and (not selection[1] or item.get('protocol')==selection[1])),None)
             if not chosen:
@@ -818,7 +1093,8 @@ class Engine:
         state['record_path']=status.get('path','')
         self._record_metrics(state,status)
         if status['running']:
-            disk=self.maintenance_status['disk']
+            settings=self.store.get_settings()
+            disk=self.maintenance.disk_status(settings,path=status.get('path'))
             if not disk['recording_allowed']:
                 self._queue_record_stop(room['id'],room,report_saved=True)
                 state['last_error']=disk['error'] or '磁盘剩余空间低于保护阈值，已暂停录制；监控继续'
@@ -925,12 +1201,14 @@ class Engine:
                     state.update(source_identity=identity,source_room=dict(room),resolved_stream_url='',stream_variants=[],resolved_room_input='',record_headers={},confirmed_live=None,live_status='checking',live_started_at='',observed_started_at='',started_at_source='',live_session_id='',avatar_url='',live_ended_at='',platform_ended_at='',offline_checks=0,status_note='',last_error='',error_code='',error_diagnostic='',failure_count=0,retry_at=0,duration_seconds=0,record_path='',record_status='idle')
                     state.update(last_success_at='',last_attempt_at='',last_probe_latency_seconds=None,_last_success_monotonic=None)
                     state.update(detection_uncertain=True,last_check_finished_at='',last_actual_check_interval_seconds=None)
+                    state['last_ended_session_id']=''
                     for key in ('_offline_recheck_at','_error_recheck_at','_last_attempt_monotonic','_status_page_not_before'): state.pop(key,None)
                     self.due[room['id']]=0
                     self._persist(room['id'],state)
                 if not room['monitor_enabled']:
                     self._cancel_recovery(room['id'])
                     if room['id'] in self.pending: self.discarded_probes.add(self.pending[room['id']][0])
+                    if room['id'] in self.metadata_pending: self.discarded_metadata.add(self.metadata_pending[room['id']][0])
                     state['live_status']='disabled'; self._stop_record(room['id'],room)
                 elif state['live_status']=='disabled': state['live_status']='checking'
                 if not room['record_enabled']: self._stop_record(room['id'],room)
@@ -947,6 +1225,8 @@ class Engine:
         # pause or round wait without clearing restrictions or duplicating work.
         configure=getattr(self.pool,'configure',None)
         if configure: configure(self.store.get_settings())
+        configure_metadata=getattr(self.metadata_pool,'configure',None)
+        if configure_metadata: configure_metadata(self.store.get_settings())
         self.wake.set()
         self.disk_checked_at=0
         self.maintenance_wake.set()
@@ -956,6 +1236,7 @@ class Engine:
             self.douyin_blocked_until=0; self.douyin_recovery_rid=None
             self.douyin_rejections.clear(); self.douyin_network_failures.clear()
             self.douyin_recovery_successes=0
+            self.douyin_empty_failures.clear()
             reset=getattr(self.providers,'invalidate_auth',None)
             if reset: reset(self.store.get_settings())
             for rid,state in self.states.items():
@@ -996,7 +1277,7 @@ class Engine:
                 if room['id'] not in wanted: continue
                 if action=='record_live' and self._state(room)['live_status']!='live': continue
                 payload={'monitor_enabled':action=='monitor_on'} if action.startswith('monitor_') else {'record_enabled':action!='record_off'}
-                if action=='record_live': payload['monitor_enabled']=True
+                if action in ('record_on','record_live'): payload['monitor_enabled']=True
                 self.store.update_room(room['id'],payload); count+=1
             self.room_changed()
             return {'updated':count}
@@ -1024,6 +1305,20 @@ class Engine:
                 item['room_status']=item['last_confirmed_status'] if room['monitor_enabled'] else 'disabled'
                 item['pending_offline_confirmation']=bool(state.get('offline_checks'))
                 item['source_refresh_pending']=bool(state.get('_source_refresh_requested') or state.get('source_refreshing'))
+                end_jobs=[job for job in self.end_metadata_jobs.values() if job['room_id']==room['id'] and (
+                    job['id']==state.get('last_ended_session_id') or not state.get('last_ended_session_id') and job['platform_session_id']==state.get('live_session_id'))]
+                end_submitted=self.metadata_pending.get(room['id'])
+                item['end_metadata_status']='ready' if state.get('platform_ended_at') else (
+                    'collecting' if end_submitted and len(end_submitted)>4 and any(job['id']==end_submitted[4] for job in end_jobs) else
+                    'retrying' if end_jobs and end_jobs[0]['next_at']>now else 'queued' if end_jobs else 'unavailable')
+                if state.get('live_started_at'):
+                    item['start_metadata_status']='estimated' if start_time_priority(state.get('started_at_source'))<3 else 'ready'
+                elif self._needs_start_metadata(room,state):
+                    current_key=self._metadata_session_key(state)
+                    retry=state.get('_metadata_session_key')==current_key and state.get('_metadata_next_at',0)>now
+                    item['start_metadata_status']='collecting' if room['id'] in self.metadata_pending else 'retrying' if retry else 'queued'
+                else:
+                    item['start_metadata_status']='unavailable'
                 if item['status_stale']: item['live_status']='unknown'
                 item['has_request_headers']=bool(item.pop('request_headers',{}))
                 rescue=self.recoveries.get(room['id'])
@@ -1074,12 +1369,21 @@ class Engine:
                      'capacity_required_concurrency':math.ceil(stats['monitoring']/status_interval*latency_p95) if latency_p95 is not None else None,
                      'schedule_mode':'independent' if status_mode else settings.get('monitor_schedule_mode','independent'),
                      'process_isolation':settings.get('monitor_process_isolation',True),
-                     'douyin_concurrency':min(self._effective_concurrency(settings),settings.get('status_douyin_concurrency',32) if status_mode else settings.get('monitor_douyin_concurrency',2)),
+                     'douyin_concurrency':min(self._effective_concurrency(settings),settings.get('status_douyin_concurrency',4) if status_mode else settings.get('monitor_douyin_concurrency',2)),
+                     'douyin_requests_per_second':self._douyin_request_rate(settings),
+                     'douyin_backoff_level':self.douyin_backoff_level,
+                     'douyin_cooldown_seconds':max(0,round(self.douyin_blocked_until-now)),
+                     'monitor_session_rebuilds':self.douyin_session_rebuilds,
                      'active_checks':len(self.pending),'recovering_checks':len(self.recoveries),
+                     'start_metadata_active_checks':len(self.metadata_pending),
+                     'start_metadata_waiting_rooms':sum(r.get('start_metadata_status') in ('collecting','retrying','queued','estimated') and r['room_status']=='live' for r in rooms),
+                     'end_metadata_waiting_sessions':len(self.end_metadata_jobs),
                      'phase':phase,'round_remaining':len(set(self.round_queue)|set(self.pending)|set(self.recoveries)),
                      'round_number':self.round_number,
                      'next_round_seconds':0 if status_mode else max(0,round(max(next_round,next_room)-now)) if not self.round_active and stats['monitoring'] else 0}
             if hasattr(self.pool,'stats'): monitor.update(self.pool.stats())
+            if hasattr(self.metadata_pool,'stats'):
+                monitor.update({'start_metadata_'+k:v for k,v in self.metadata_pool.stats().items()})
             return dict(auth={'douyin_authorized':authorized},maintenance=dict(self.maintenance_status),monitor=monitor,rooms=rooms,settings=settings,events=self.store.list_events(),stats=stats,ffmpeg_available=self.recorder.available(self.store.get_settings()),poll_interval=status_interval,native_sound_available=os.name=='nt')
     def close(self):
         if self.closed: return
@@ -1089,6 +1393,7 @@ class Engine:
         if self.thread: self.thread.join()
         if self.maintenance_thread: self.maintenance_thread.join()
         if self.ffmpeg_prepare_thread: self.ffmpeg_prepare_thread.join()
+        self.metadata_pool.shutdown(wait=True,cancel_futures=True)
         self.pool.shutdown(wait=True,cancel_futures=True)
         close_errors=self.recorder.close()
         with self.lock:

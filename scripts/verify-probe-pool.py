@@ -113,6 +113,21 @@ class ProbePoolChecks(unittest.TestCase):
         self.assertTrue(all(value == 'x' * 16384 for value in result.headers.values()))
         self.assertEqual(result.nickname, '隔离检查')
 
+    def test_rebuild_replaces_busy_transport_only_after_request_finishes(self):
+        self.assertIs(self.submit().result(timeout=5).live,False)
+        old=self.workers()[0]
+        self.server.slow_entered.clear(); self.server.release_slow.clear()
+        slow_room=dict(self.room,status_url=self.room['status_url'].replace('/status','/slow'))
+        future=self.submit(room=slow_room)
+        self.assertTrue(self.server.slow_entered.wait(2))
+        self.pool.rebuild_sessions()
+        self.assertIsNone(old.process.poll())
+        self.server.release_slow.set()
+        self.assertIs(future.result(timeout=5).live,False)
+        self.assertIs(self.submit().result(timeout=5).live,False)
+        self.assertNotEqual(self.workers()[0].process.pid,old.process.pid)
+        self.assertIsNotNone(old.process.poll())
+
     def test_slow_loopback_endpoint_respects_total_deadline(self):
         # Measure the network deadline independently of cold process startup,
         # which can consume the short budget under parallel suite load.

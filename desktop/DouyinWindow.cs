@@ -100,6 +100,9 @@ internal sealed class DouyinWindow : Form
 		{
 			if (authorization)
 			{
+				// Reuse the persistent profile under data/webview2. Saved local
+				// authorization is also held by the backend without an expiry;
+				// do not rewrite the platform's cookie expiration dates here.
 				await browser.EnsureCoreWebView2Async(environment);
 			}
 			else

@@ -70,6 +70,180 @@ class ProviderStatusChecks(unittest.TestCase):
                 self.assertIsNone(result.live)
                 self.assertEqual(request.call_count, 1)
 
+    def test_metadata_only_uses_confirmed_session_without_status_or_identity(self):
+        settings = self.settings | {'_metadata_only': True, '_metadata_session_id': '456',
+                                    'douyin_cookie': 'private-session', 'douyin_user_agent': 'private-agent'}
+        response = self.response({'data': {'room': {'status': 2, 'id_str': '456',
+            'start_time': 1700000000, 'owner': {'avatar_thumb': {'url_list': ['https://image.invalid/avatar.jpg']}},
+            'stream_url': {'hls_pull_url': 'https://media.invalid/live.m3u8'}}}})
+        with patch('livewatch.providers._request', return_value=response) as request, \
+                patch.object(self.provider, '_douyin', side_effect=AssertionError('status probed')):
+            result = self.provider.check(self.room | {'request_headers': {'Cookie': 'private-header'}}, settings)
+            cached = self.provider.check(self.room, settings)
+        self.assertIs(result.live, True)
+        self.assertEqual(result.live_session_id, '456')
+        self.assertEqual(result.live_started_at, '2023-11-14T22:13:20+00:00')
+        self.assertEqual(result.started_at_source, 'douyin.room.start_time')
+        self.assertEqual(cached.live_started_at, result.live_started_at)
+        self.assertEqual(result.stream_url, '')
+        self.assertEqual(result.stream_variants, [])
+        self.assertEqual(request.call_count, 1)
+        self.assertIn('/webcast/room/reflow/info/?room_id=456&', request.call_args.args[0])
+        self.assertEqual(set(request.call_args.args[1]), {'Referer', 'User-Agent'})
+        self.assertNotIn('private', str(request.call_args))
+
+    def test_metadata_only_rejects_other_or_offline_session_and_room_creation(self):
+        for details in ({'status': 2, 'id_str': '789', 'start_time': 1700000000},
+                        {'status': 4, 'id_str': '456', 'start_time': 1700000000},
+                        {'status': 2, 'id_str': '456', 'create_time': 1700000000}):
+            provider = ProviderRegistry()
+            with self.subTest(details=details), patch('livewatch.providers._request',
+                    return_value=self.response({'data': {'room': details}})):
+                result = provider.check(self.room, self.settings | {
+                    '_metadata_only': True, '_metadata_session_id': '456'})
+            self.assertIsNone(result.live)
+            self.assertEqual(result.live_started_at, '')
+            self.assertEqual(result.avatar_url, '')
+
+    def test_metadata_only_failure_is_throttled_then_retried(self):
+        settings = self.settings | {'_metadata_only': True, '_metadata_session_id': '456'}
+        with patch('livewatch.providers._request', side_effect=ProbeError('network failure', 'network_error')) as request:
+            first = self.provider.check(self.room, settings)
+            second = self.provider.check(self.room, settings)
+        self.assertIsNone(first.live)
+        self.assertIsNone(second.live)
+        self.assertEqual(request.call_count, 1)
+        self.provider._metadata_cache['456']['checked'] -= 61
+        with patch('livewatch.providers._request', return_value=self.response({'data': {'room': {
+                'status': 2, 'id_str': '456', 'start_time': 1700000000}}})) as request:
+            result = self.provider.check(self.room, settings)
+        self.assertEqual(request.call_count, 1)
+        self.assertTrue(result.live_started_at)
+
+    def test_metadata_only_accepts_explicit_current_broadcast_duration(self):
+        with patch('livewatch.providers._request', return_value=self.response({'data': {'room': {
+                'status': 2, 'id_str': '456', 'live_duration_seconds': 600}}, 'extra': {'now': 1700000600}})):
+            result = self.provider.check(self.room, self.settings | {
+                '_metadata_only': True, '_metadata_session_id': '456'})
+        self.assertIs(result.live, True)
+        self.assertEqual(result.live_started_at, '2023-11-14T22:13:20+00:00')
+        self.assertIn('推算', result.started_at_source)
+
+    def test_metadata_only_preserves_endpoint_retry_after(self):
+        for ended in (False, True):
+            provider = ProviderRegistry()
+            settings = self.settings | {'_metadata_only': True, '_metadata_session_id': '456', '_metadata_ended': ended}
+            with self.subTest(ended=ended), patch('livewatch.providers._request',
+                    side_effect=ProbeError('limited', 'rate_limited', 600)) as request:
+                first = provider.check(self.room, settings)
+                key = 'ended:456' if ended else '456'
+                provider._metadata_cache[key]['checked'] -= 61
+                second = provider.check(self.room, settings)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(first.retry_after, 600)
+            self.assertGreater(second.retry_after, 500)
+            self.assertEqual(second.error_code, 'rate_limited')
+            self.assertIsNone(second.live)
+
+    def test_ended_metadata_uses_only_matching_offline_session_end_time(self):
+        settings = self.settings | {'_metadata_only': True, '_metadata_session_id': '456',
+            '_metadata_ended': True, 'douyin_cookie': 'private-session'}
+        body = self.response({'data': {'room': {'status': 4, 'id_str': '456',
+            'start_time': 1700000000, 'end_time': 1700000600,
+            'stream_url': {'hls_pull_url': 'https://media.invalid/live.m3u8'}}}})
+        with patch('livewatch.providers._request', return_value=body) as request, \
+                patch.object(self.provider, '_douyin', side_effect=AssertionError('status probed')):
+            result = self.provider.check(self.room, settings)
+            cached = self.provider.check(self.room, settings)
+        self.assertIs(result.live, False)
+        self.assertEqual(result.live_session_id, '456')
+        self.assertEqual(result.live_ended_at, '2023-11-14T22:23:20+00:00')
+        self.assertEqual(cached.live_ended_at, result.live_ended_at)
+        self.assertEqual(result.live_started_at, '2023-11-14T22:13:20+00:00')
+        self.assertEqual(result.started_at_source, 'douyin.room.start_time')
+        self.assertEqual(result.stream_url, '')
+        self.assertEqual(result.stream_variants, [])
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(set(request.call_args.args[1]), {'Referer', 'User-Agent'})
+        self.assertNotIn('private', str(request.call_args))
+
+    def test_ended_metadata_rejects_live_other_invalid_and_missing_end(self):
+        samples = [
+            {'status': 2, 'id_str': '456', 'end_time': 1700000600},
+            {'status': 4, 'id_str': '789', 'end_time': 1700000600},
+            {'status': 4, 'id_str': '456', 'create_time': 1700000600},
+            {'status': 4, 'id_str': '456', 'end_time': 'not a time'},
+            {'status': 4, 'id_str': '456', 'end_time': '2023-11-14T22:23:20'},
+        ]
+        for details in samples:
+            with self.subTest(details=details), patch('livewatch.providers._request',
+                    return_value=self.response({'data': {'room': details}})):
+                result = ProviderRegistry().check(self.room, self.settings | {
+                    '_metadata_only': True, '_metadata_session_id': '456', '_metadata_ended': True})
+            self.assertIsNone(result.live)
+            self.assertEqual(result.live_ended_at, '')
+
+    def test_ended_metadata_can_supply_start_before_end_is_available(self):
+        settings = self.settings | {'_metadata_only': True, '_metadata_session_id': '456', '_metadata_ended': True}
+        start_only = self.response({'data': {'room': {'status': 4, 'id_str': '456',
+            'start_time': 1700000000, 'live_duration_seconds': 900}}})
+        complete = self.response({'data': {'room': {'status': 4, 'id_str': '456',
+            'start_time': 1700000000, 'end_time': 1700000600}}})
+        with patch('livewatch.providers._request', side_effect=[start_only, complete]) as request:
+            first = self.provider.check(self.room, settings)
+            cached = self.provider.check(self.room, settings)
+            self.provider._metadata_cache['ended:456']['checked'] -= 61
+            later = self.provider.check(self.room, settings)
+        self.assertIs(first.live, False)
+        self.assertEqual(first.live_started_at, '2023-11-14T22:13:20+00:00')
+        self.assertEqual(first.live_ended_at, '')
+        self.assertEqual(cached.live_started_at, first.live_started_at)
+        self.assertTrue(later.live_ended_at)
+        self.assertEqual(request.call_count, 2)
+
+    def test_ended_metadata_never_infers_start_from_duration_or_creation(self):
+        for fields in ({'live_duration_seconds': 900}, {'create_time': 1700000000}):
+            with self.subTest(fields=fields), patch('livewatch.providers._request', return_value=self.response({
+                    'data': {'room': {'status': 4, 'id_str': '456', 'end_time': 1700000600} | fields}})):
+                result = ProviderRegistry().check(self.room, self.settings | {
+                    '_metadata_only': True, '_metadata_session_id': '456', '_metadata_ended': True})
+            self.assertIs(result.live, False)
+            self.assertEqual(result.live_started_at, '')
+            self.assertTrue(result.live_ended_at)
+
+    def test_ended_metadata_rejects_invalid_end_but_keeps_valid_start(self):
+        with patch('livewatch.providers._request', return_value=self.response({'data': {'room': {
+                'status': 4, 'id_str': '456', 'start_time': 1700000600, 'end_time': 1700000000}}})):
+            result = self.provider.check(self.room, self.settings | {
+                '_metadata_only': True, '_metadata_session_id': '456', '_metadata_ended': True})
+        self.assertIs(result.live, False)
+        self.assertTrue(result.live_started_at)
+        self.assertEqual(result.live_ended_at, '')
+
+    def test_live_cache_does_not_hide_later_ended_time(self):
+        live = self.response({'data': {'room': {'status': 2, 'id_str': '456', 'start_time': 1700000000}}})
+        ended = self.response({'data': {'room': {'status': 4, 'id_str': '456', 'end_time': 1700000600}}})
+        settings = self.settings | {'_metadata_only': True, '_metadata_session_id': '456'}
+        with patch('livewatch.providers._request', side_effect=[live, ended]) as request:
+            current = self.provider.check(self.room, settings)
+            previous = self.provider.check(self.room, settings | {'_metadata_ended': True})
+        self.assertTrue(current.live_started_at)
+        self.assertTrue(previous.live_ended_at)
+        self.assertIs(previous.live, False)
+        self.assertEqual(request.call_count, 2)
+
+    def test_metadata_only_invalid_targets_issue_no_requests(self):
+        targets = [(self.room, ''), (self.room, 'https://other.invalid'), (self.room, 456),
+                   (self.room | {'platform': 'wechat'}, '456'),
+                   (self.room | {'status_url': 'https://status.invalid'}, '456'),
+                   (self.room | {'stream_url': 'https://media.invalid/live.m3u8'}, '456')]
+        for room, sid in targets:
+            with self.subTest(room=room, sid=sid), patch('livewatch.providers._request') as request:
+                result = self.provider.check(room, self.settings | {
+                    '_metadata_only': True, '_metadata_session_id': sid})
+            self.assertIsNone(result.live)
+            request.assert_not_called()
+
     def test_unsupported_high_frequency_sources_issue_no_requests(self):
         sources = [{"room_input": "@account", "input_type": "account"},
                    {"room_input": "https://www.douyin.com/user/MS4wLjABAAAA12345678"},

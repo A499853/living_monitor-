@@ -8,6 +8,7 @@ import time
 
 from .providers import _source_headers, validate_headers, validate_url
 from .recorder import Recorder
+from .media_options import select_stream
 
 
 class Playback:
@@ -25,12 +26,9 @@ class Playback:
             url = runtime.get('resolved_stream_url') or room.get('stream_url')
             if url:
                 streams = [{'url': url, 'quality': 'unknown', 'protocol': 'flv' if '.flv' in url else 'hls'}]
-        candidates = [s for s in streams if (not quality or s.get('quality') == quality) and (not protocol or s.get('protocol') == protocol)]
-        if not candidates:
-            raise ValueError('当前未取得所选直播源，请等待检查完成或选择其他画质。')
-        rank = ['origin', 'blue', 'ultra', 'high', 'standard', 'low', 'other', 'unknown']
-        candidates.sort(key=lambda s: (rank.index(s.get('quality')) if s.get('quality') in rank else len(rank), s.get('protocol') != 'hls'))
-        selected = candidates[0]
+        explicit = bool(quality or protocol)
+        selected = select_stream(streams, quality if explicit else settings.get('playback_quality', 'below_origin_2'),
+                                 protocol if explicit else settings.get('playback_protocol', 'hls'), strict=explicit)
         url = validate_url(selected['url'])
         headers = _source_headers(url, validate_headers(runtime.get('record_headers') or room.get('request_headers') or {}))
         with self.lock:

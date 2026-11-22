@@ -21,7 +21,49 @@ button.status{border:0;cursor:pointer;text-align:left}button.status:hover{filter
 @media(max-width:1200px){.quick-bottom>span{display:none}.quick-bottom>div{margin-left:auto}.header-actions{gap:8px}.stats{gap:9px}.topbar{gap:12px}.nav{padding:0 9px}}
 @media(max-width:850px){.topbar{height:auto;min-height:48px;flex-wrap:wrap}.quick-add-controls{flex-direction:column;gap:4px}.quick-input-wrap>textarea{min-width:80px}.stats .interval{display:none}.table-scroll{height:calc(100vh - 300px)}.quick-bottom>div{flex-wrap:wrap}.player-dialog{width:96vw}}
 
-th{height:34px}td{height:56px}.group-row td{height:27px}tbody .live-start-cell{padding-top:6px;padding-bottom:6px}
+/* Compact monitoring rows retain two-line identity and time details. */
+.table-scroll table{min-width:1510px;font-size:13px}
+.table-scroll th{height:30px;padding:6px 8px}
+.table-scroll td{height:44px;padding:4px 8px}
+.table-scroll th:first-child,.table-scroll td:first-child{width:36px;padding-left:9px;padding-right:8px}
+.table-scroll th:nth-child(2){width:72px}
+.table-scroll th:nth-child(3){width:52px}
+.table-scroll th:nth-child(4){width:230px}
+.table-scroll th:nth-child(5){width:156px}
+.table-scroll th:nth-child(6){width:112px}
+.table-scroll th:nth-child(7){width:115px}
+.table-scroll th:nth-child(8){width:135px}
+.table-scroll th:nth-child(9){width:64px}
+.table-scroll th:nth-child(10){width:80px}
+.table-scroll th:nth-child(11){width:130px}
+.table-scroll th:nth-child(12){width:140px}
+.table-scroll th:last-child{width:126px}
+.table-scroll .room-wrap{gap:7px}
+.table-scroll .avatar{width:30px;height:30px;font-size:15px}
+.table-scroll .avatar.is-live:after{left:2px;right:2px;bottom:-3px;font-size:8px;line-height:11px}
+.table-scroll .platform-mark{width:26px;height:26px;border-radius:6px}
+.table-scroll .platform-mark svg{width:22px;height:22px}
+.table-scroll .room-title-line{gap:6px}
+.table-scroll .room-name{font-size:13px;line-height:1.4;max-width:153px}
+.table-scroll .room-meta{font-size:10px;line-height:1.3;margin-top:0}
+.table-scroll .play-button{width:22px;height:22px;font-size:16px}
+.table-scroll .start-time{font-size:16px;line-height:1.25}
+.table-scroll .start-date{font-size:11px;line-height:1.2;margin-top:1px}
+.table-scroll .live-start-cell{padding-top:4px;padding-bottom:4px}
+.table-scroll .unknown-start{font-size:12px}
+.observed-start .start-date:after{content:" · 检测";font-size:10px;color:#8c9bb0}
+.observed-end:after{content:" · 检测";font-size:10px;color:#8c9bb0}
+.table-scroll .record-cell{line-height:1.25}
+.table-scroll .record-state,.table-scroll .record-duration{font-size:12px}
+.table-scroll .record-duration{margin-top:1px}
+.table-scroll .compact-time{font-size:12px;line-height:1.4}
+.table-scroll .remark{font-size:12px}
+.table-scroll .status{line-height:1.4;padding-top:2px;padding-bottom:2px}
+.table-scroll .number-cell{font-size:12px;padding-left:3px;padding-right:5px}
+.table-scroll .drag-handle{width:22px;height:26px;font-size:20px;margin-right:1px}
+.table-scroll .row-actions{gap:8px}
+.table-scroll .row-actions button{font-size:12px}
+.table-scroll .group-row td{height:24px;padding:3px 10px;font-size:11px}
 
 /* Round interval and per-room delay follow the monitoring workflow. */
 #settingsDialog{width:760px}.monitor-strategy{border:1px solid #dfe7f2;border-radius:7px;margin:0 0 22px;padding:13px 16px 12px;background:#fbfcff;min-width:0}.monitor-strategy legend{font-size:14px;font-weight:600;color:#587298;padding:0 7px}.strategy-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap;color:#64758d;font-size:14px;line-height:1.8}.strategy-row+.strategy-row{margin-top:15px}.number-stepper{display:inline-flex;align-items:stretch;height:36px;border:1px solid #d5dfed;border-radius:5px;overflow:hidden;background:#fff;flex:none}.number-stepper button{width:34px;min-width:34px;padding:0;border:0;background:#f2f6fc;color:#7793b9;font-size:20px;line-height:1}.number-stepper button:hover{background:#e5efff;color:#3478f6}.number-stepper input{width:78px;min-width:0;border:0!important;border-left:1px solid #dfe6f0!important;border-right:1px solid #dfe6f0!important;border-radius:0!important;padding:4px 6px!important;text-align:center;font-size:15px;color:#4d6b95;appearance:textfield;box-shadow:none!important}.number-stepper input::-webkit-inner-spin-button,.number-stepper input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}.strategy-hint{color:#95a0b1;font-size:12px;line-height:1.85;margin:14px 0 0}.number-stepper:focus-within{outline:2px solid #8db8ff;outline-offset:2px}.number-stepper input:focus{outline:none}@media(max-width:650px){.monitor-strategy{padding:11px}.strategy-row{gap:7px}.number-stepper input{width:64px}}
@@ -31,3 +73,7 @@ th{height:34px}td{height:56px}.group-row td{height:27px}tbody .live-start-cell{p
 .monitor-metrics{padding:0 12px 7px;font-size:12px;line-height:1.8;color:#7d8fa6}.monitor-metrics.has-stale{color:#a87942}.status.unknown{background:#fff0de;color:#a87942}#statusMonitorSettings .form-grid{margin-top:14px}#legacyMonitorSettings{margin-top:14px}
 
 .source-result{flex-wrap:wrap}.source-result>span{flex:1 1 100%}.record-state.recovering,.record-state.queued,.record-state.starting{color:#a1742b}.record-state.stopped,.record-state.completed{color:#7e8997}
+
+/* Source shortcuts stay beside room names; portrait video keeps a compact frame. */
+.table-scroll th:nth-child(4){width:285px}.table-scroll .row-copy-source{flex:none;font-size:11px;line-height:1.5;padding:2px 5px;border:1px solid #b5cff5;border-radius:4px;background:#f6faff;color:#407bcc}.table-scroll .row-copy-source:hover{background:#e5f0ff}.table-scroll .room-name{min-width:0;overflow:hidden;text-overflow:ellipsis}.table-scroll .room-info{min-width:0}.source-primary-actions{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}.source-profile .source-primary-actions .button{margin-left:0}.source-profile>div:not(.source-primary-actions){min-width:0}.source-profile h3{overflow-wrap:anywhere}.directory-input{display:flex;align-items:center;gap:8px}.directory-input input{min-width:0;flex:1}.directory-input .button{flex:none}.record-options-dialog{width:590px}.record-options-dialog .dialog-head small{display:block;margin-top:8px;color:#8899b0;font-size:13px;overflow-wrap:anywhere}.recording-options{padding:13px;border:1px solid #e2eaf4;border-radius:6px;background:#f8fbff;margin:0 0 20px}.source-preferences{margin-bottom:20px}.player-dialog{width:min(380px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 24px)}.player-dialog .dialog-head{padding:10px 14px;min-height:64px}.player-dialog .dialog-head>div{min-width:0}.player-dialog h2,.player-dialog small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}.player-dialog video{object-fit:contain;max-height:calc(100vh - 160px)}.player-footer{gap:8px;flex-wrap:wrap;padding:8px 12px}.player-footer .button{padding:4px 9px}
+@media(max-width:650px){.source-primary-actions{margin-left:0;width:100%}.source-preferences .form-grid,.record-options-dialog .form-grid{grid-template-columns:1fr}.source-profile{gap:10px}.source-profile .avatar{width:45px;height:45px}.directory-input{gap:5px}.directory-input .button{padding:6px 9px}}

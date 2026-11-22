@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 from .storage import room_directory, now_iso
+from .media_options import recording_directory
 
 def safe_message(value, secrets=()):
     text=str(value)
@@ -119,7 +120,7 @@ class Recorder:
             try:
                 self.maintenance.register_recording(path,process_id=job['process'].pid)
                 self.maintenance.finish_recording(path)
-                self.maintenance.register_recording(job['path'],process_id=job['process'].pid)
+                self.maintenance.register_recording(job['path'],process_id=job['process'].pid,previous_segment=path)
             except (OSError,ValueError,sqlite3.Error):
                 job['log_error']='录制片段登记暂时失败，保留文件'
         return True
@@ -168,12 +169,12 @@ class Recorder:
                 if self.jobs[rid].get('stopping') or self.jobs[rid]['process'].poll() is None: return
                 raise ValueError('上一段录制尚未回收，请稍候')
             if len(self.jobs)>=int(settings.get('max_recordings',4)): raise ValueError('录制任务已达到并发上限')
-            if self.maintenance and not self.maintenance.disk_status(settings)['recording_allowed']:
+            if self.maintenance and not self.maintenance.disk_status(settings,room=room)['recording_allowed']:
                 raise ValueError('磁盘剩余空间低于保护阈值，已暂停录制；监控继续')
             binary=self.executable(settings)
             if not binary: raise ValueError('未找到 FFmpeg，请在设置中配置 ffmpeg.exe')
             if urlsplit(url).scheme not in ['http','https']: raise ValueError('录制源必须为 HTTP(S) 地址')
-            directory=self.root/'video'/room_directory(room)
+            directory=recording_directory(self.root,settings,room)/room_directory(room)
             directory.mkdir(parents=True,exist_ok=True)
             stamp=datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             output=recording_output_path(directory,room.get('nickname') or '未命名直播间')

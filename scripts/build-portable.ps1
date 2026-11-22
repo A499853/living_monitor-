@@ -8,6 +8,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ($PackageName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]+$') { throw 'Invalid package name.' }
+$ffmpegPath = Join-Path $projectRoot 'tools\ffmpeg.exe'
+if (-not (Test-Path -LiteralPath $ffmpegPath -PathType Leaf) -or (Get-Item -LiteralPath $ffmpegPath).Length -le 1000000) {
+    throw 'A complete tools\ffmpeg.exe is required for the delivery package.'
+}
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build-desktop.ps1') }
 $stageParent = Join-Path $projectRoot 'build\portable'
 $stage = [IO.Path]::GetFullPath((Join-Path $stageParent $PackageName))
@@ -21,6 +25,10 @@ foreach ($name in @($exeName, "$exeName.config", 'Microsoft.Web.WebView2.Core.dl
 foreach ($name in @('dependency-manifest.json', 'desktop-dependency-manifest.json')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $stage
 }
+# FFmpeg ships ready to run; only Python and WebView2 need first-launch downloads.
+$packagedTools = Join-Path $stage 'tools'
+New-Item -ItemType Directory -Path $packagedTools -Force | Out-Null
+Copy-Item -LiteralPath $ffmpegPath -Destination (Join-Path $packagedTools 'ffmpeg.exe')
 foreach ($folder in @('app', 'licenses')) {
     $sourceRoot = Join-Path $projectRoot $folder
     foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -Recurse -File) {

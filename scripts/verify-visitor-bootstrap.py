@@ -115,13 +115,13 @@ class VisitorBootstrapChecks(unittest.TestCase):
         self.assertIsNone(second.live)
         self.assertEqual(request.call_count,3)
 
-    def test_444_without_server_retry_can_recover_but_retry_after_is_respected(self):
+    def test_444_does_not_request_fallback_and_retry_after_is_respected(self):
         self.warm()
         with patch('livewatch.providers._request',side_effect=[ProbeError('limited','rate_limited',60,'http=444'),page_response(live=False)]) as request:
             result=self.provider.check(self.room,self.settings)
-        self.assertIs(result.live,False)
-        self.assertEqual(result.retry_after,0)
-        self.assertEqual(request.call_count,2)
+        self.assertIsNone(result.live)
+        self.assertEqual(result.retry_after,60)
+        self.assertEqual(request.call_count,1)
         self.provider=ProviderRegistry();self.warm()
         with patch('livewatch.providers._request',side_effect=ProbeError('limited','rate_limited',60,'http=429 retry_after=60')) as request:
             result=self.provider.check(self.room,self.settings)
