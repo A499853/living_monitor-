@@ -16,15 +16,13 @@ def room_directory(room):
     return f"{room['platform']}_{value}_{room['id'][:8]}"
 
 class Store:
-    FIELDS = {'platform','room_input','nickname','monitor_enabled','record_enabled','remark','stream_url','status_url','request_headers','input_type','transfer_options'}
+    FIELDS = {'platform','room_input','nickname','monitor_enabled','record_enabled','remark','stream_url','status_url','request_headers','input_type','transfer_options','record_quality','record_protocol'}
     # poll_interval is retained only to read older settings; monitoring uses rounds.
     # The high-frequency status profile is intentionally separate from the
-    # recording/metadata cadence.  Five seconds is the target interval for a
-    # status-only fleet; callers can raise it when a provider or network is
-    # more restrictive.  A bounded 32-worker pool is enough to service 150
-    # rooms with sub-second mean latency while keeping requests serialized.
-    # This is a capacity target; outages and platform throttling can miss it.
-    DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'status_only_mode':True,'status_poll_interval_seconds':5,'status_check_concurrency':32,'status_douyin_concurrency':32,'status_request_timeout':4,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'douyin_access_mode':'anonymous','monitor_identity_isolation':True}
+    # recording/metadata cadence. Eight seconds after each completed check is
+    # the default delay. A bounded 32-worker pool and global dispatch budget
+    # protect large fleets; real request and queue latency still apply.
+    DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'status_only_mode':True,'status_poll_interval_seconds':8,'status_check_concurrency':32,'status_douyin_concurrency':32,'status_request_timeout':4,'monitor_max_requests_per_second':20,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'record_segment_seconds':1800,'record_stall_seconds':30,'record_start_timeout_seconds':30,'douyin_access_mode':'anonymous','monitor_identity_isolation':True}
     def __init__(self, root):
         self.root = Path(root).resolve()
         for name in ['data','logs','video','time_begin_over']:
@@ -36,6 +34,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS rooms(id TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS runtime(room_id TEXT PRIMARY KEY,payload TEXT);
+        CREATE TABLE IF NOT EXISTS recording_tasks(room_id TEXT PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT,room_id TEXT,nickname TEXT,message TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,room_id TEXT,started_at TEXT,ended_at TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS owned_files(path TEXT PRIMARY KEY,kind TEXT NOT NULL,active INTEGER NOT NULL,registered_at REAL NOT NULL,finished_at REAL,process_id INTEGER,device TEXT,inode TEXT,size INTEGER,modified_ns TEXT);
@@ -62,7 +61,12 @@ class Store:
         room = dict(previous or dict(platform='douyin',room_input='',nickname='',monitor_enabled=True,record_enabled=False,remark='',stream_url='',status_url='',request_headers={},input_type='auto',transfer_options={}))
         room.setdefault('input_type','auto')
         room.setdefault('transfer_options',{})
+        room.setdefault('record_quality','')
+        room.setdefault('record_protocol','')
         room.update({k:v for k,v in payload.items() if k in self.FIELDS})
+        for key in ('record_quality','record_protocol'):
+            if not isinstance(room[key],str) or not re.fullmatch(r'[A-Za-z0-9_.-]{0,64}',room[key]):
+                raise ValueError('录制画质或格式无效')
         for key,limit in [('platform',20),('room_input',2048),('nickname',160),('remark',2000),('stream_url',8192),('status_url',8192)]:
             if not isinstance(room[key],str) or len(room[key])>limit or '\x00' in room[key]:
                 raise ValueError(f'{key} 内容无效或过长')
@@ -179,6 +183,7 @@ class Store:
             self.get_room(room_id)
             self.db.execute('DELETE FROM rooms WHERE id=?',(room_id,))
             self.db.execute('DELETE FROM runtime WHERE room_id=?',(room_id,))
+            self.db.execute('DELETE FROM recording_tasks WHERE room_id=?',(room_id,))
     def get_settings(self):
         with self.lock:
             result=dict(self.DEFAULTS)
@@ -197,7 +202,7 @@ class Store:
                 count=value[key]
                 if isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=maximum:
                     raise ValueError(f'{label}必须为 1～{maximum} 之间的整数')
-        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,15,'高频状态请求超时')]:
+        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,15,'高频状态请求超时'),('monitor_max_requests_per_second',1,100,'全局每秒检查上限'),('record_segment_seconds',60,86400,'录制分段时长'),('record_stall_seconds',10,300,'录制停滞期限'),('record_start_timeout_seconds',10,120,'录制启动期限')]:
             if key in value:
                 number=value[key]
                 if isinstance(number,bool) or not isinstance(number,(int,float)) or not math.isfinite(number) or not lo<=number<=hi:
@@ -256,6 +261,18 @@ class Store:
     def get_runtime(self,room_id):
         with self.lock:
             row=self.db.execute('SELECT payload FROM runtime WHERE room_id=?',(room_id,)).fetchone()
+            return json.loads(row[0]) if row else {}
+    def save_record_task(self,room_id,payload):
+        """One durable current task per room; never store signed URLs or headers."""
+        keys=('task_id','state','path','duration_seconds','last_media_write_at','bytes_written','segment_count','process_id','reason')
+        value={key:payload[key] for key in keys if key in payload}
+        with self.lock,self.db:
+            # A finishing worker must not recreate a task for a deleted room.
+            if not self.db.execute('SELECT 1 FROM rooms WHERE id=?',(room_id,)).fetchone(): return
+            self.db.execute('INSERT OR REPLACE INTO recording_tasks VALUES(?,?,?)',(room_id,json.dumps(value,ensure_ascii=False),now_iso()))
+    def get_record_task(self,room_id):
+        with self.lock:
+            row=self.db.execute('SELECT payload FROM recording_tasks WHERE room_id=?',(room_id,)).fetchone()
             return json.loads(row[0]) if row else {}
     def append_event(self,kind,room,message):
         with self.lock,self.db:

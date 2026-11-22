@@ -29,3 +29,5 @@ th{height:34px}td{height:56px}.group-row td{height:27px}tbody .live-start-cell{p
 #roomInput{min-height:88px;resize:vertical;line-height:1.65}.share-login{display:inline;padding:0 2px;min-height:0;font-size:inherit;vertical-align:baseline}.quick-bottom>span:has(.share-login){max-width:52%}@media(max-width:850px){.quick-bottom>span:has(.share-login){max-width:100%}}
 
 .monitor-metrics{padding:0 12px 7px;font-size:12px;line-height:1.8;color:#7d8fa6}.monitor-metrics.has-stale{color:#a87942}.status.unknown{background:#fff0de;color:#a87942}#statusMonitorSettings .form-grid{margin-top:14px}#legacyMonitorSettings{margin-top:14px}
+
+.source-result{flex-wrap:wrap}.source-result>span{flex:1 1 100%}.record-state.recovering,.record-state.queued,.record-state.starting{color:#a1742b}.record-state.stopped,.record-state.completed{color:#7e8997}

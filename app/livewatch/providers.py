@@ -1117,10 +1117,18 @@ class ProviderRegistry:
             # boolean status; recording probes retain the existing media data.
             return ProbeResult(True, nickname=name[:200], **metadata)
         url = room.get('stream_url') or data.get('stream_url') or ''
-        if url:
-            url = validate_url(url)
-        merged = _source_headers(url, headers | validate_headers(data.get('headers') or {}))
-        return ProbeResult(True, nickname=name[:200], stream_url=url, headers=merged, message='状态接口报告已开播，但未提供直播源。' if not url else '', **metadata)
+        try:
+            if url: url = validate_url(url)
+            merged = _source_headers(url, headers | validate_headers(data.get('headers') or {}))
+        except ProbeError:
+            # Media selection and room state are independent. A broken optional
+            # source must not erase an explicit successful live observation.
+            return ProbeResult(True,nickname=name[:200],message='状态接口确认已开播，但直播源或媒体请求头无效，请重新取源。',**metadata)
+        path=urllib.parse.urlsplit(url).path.lower() if url else ''
+        protocol=next((kind for kind in ('flv','ts','mp4') if path.endswith('.'+kind)),'hls')
+        variants=[{'quality':'unknown','label':'当前直播源','protocol':protocol,'url':url,'source_key':'status_api'}] if url else []
+        return ProbeResult(True, nickname=name[:200], stream_url=url, headers=merged, stream_variants=variants,
+                           message='状态接口报告已开播，但未提供直播源。' if not url else '', **metadata)
 
     def _stream(self, room, headers):
         headers = _source_headers(room['stream_url'], headers)

@@ -103,7 +103,19 @@ class ProviderStatusChecks(unittest.TestCase):
             result = self.provider.check(room, self.settings)
         self.assertIs(result.live, True)
         self.assertEqual(result.stream_url, "https://media.invalid/live.m3u8")
+        self.assertEqual(result.stream_variants[0]['quality'],'unknown')
+        self.assertEqual(result.stream_variants[0]['protocol'],'hls')
+        self.assertEqual(result.stream_variants[0]['url'],result.stream_url)
         self.assertEqual(request.call_count, 1)
+
+    def test_invalid_recording_source_does_not_erase_explicit_live_state(self):
+        room=self.room | {'status_url':'https://status.invalid/room','record_enabled':True}
+        for media in ({'stream_url':'invalid'}, {'stream_url':'https://media.invalid/live.flv','headers':['invalid']}):
+            with self.subTest(media=media), patch('livewatch.providers._request',return_value=self.response({'live':True,**media})):
+                result=self.provider.check(room,self.settings)
+            self.assertIs(result.live,True)
+            self.assertEqual(result.stream_url,'')
+            self.assertTrue(result.message)
 
     def test_recording_manual_source_keeps_legacy_media_probe(self):
         room = self.room | {"stream_url": "https://media.invalid/live.m3u8", "record_enabled": True}

@@ -29,7 +29,7 @@ class Fixture(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 256
 
-    def __init__(self):
+    def __init__(self, request_timeout=4):
         super().__init__(("127.0.0.1", 0), Handler)
         self.lock = threading.Lock()
         self.live = False
@@ -38,6 +38,7 @@ class Fixture(ThreadingHTTPServer):
         self.active = 0
         self.peak_active = 0
         self.stop = threading.Event()
+        self.hang_seconds=request_timeout+1
 
     def handle_error(self, request, client_address):
         # Killing a deadline worker may reset the connection before the HTTP
@@ -61,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if faults and number < 3:
                 # More than the real process deadline, including socket read.
-                self.server.stop.wait(3)
+                self.server.stop.wait(self.server.hang_seconds)
             elif faults and number < 6:
                 self.connection.shutdown(socket.SHUT_RDWR)
                 return
@@ -101,14 +102,16 @@ def await_condition(engine, predicate, seconds, label):
     }, ensure_ascii=True))
 
 
-def run(duration, report_path):
+def run(duration, report_path, request_timeout=4):
     logging.disable(logging.CRITICAL)
-    server = Fixture()
+    server = Fixture(request_timeout)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     report = {"fixture": "loopback HTTP with hangs, disconnects, 429 and recovery",
               "rooms": 150, "real_platform_test": False,
-              "configured_interval_seconds": 3, "configured_timeout_seconds": 2,
+              "configured_interval_seconds": 8, "configured_timeout_seconds": request_timeout,
+              "configured_request_budget_per_second": 20,
+              "fault_hang_seconds":server.hang_seconds,
               "periodic_fault_start_seconds": 60, "periodic_fault_cycle_seconds": 60,
               "periodic_fault_duration_seconds": 8, "periodic_fault_windows": 0,
               "resource_scope": "test parent process; worker process count separately bounded"}
@@ -117,8 +120,9 @@ def run(duration, report_path):
     with tempfile.TemporaryDirectory(prefix="livewatch-weak-net-") as directory:
         try:
             store = Store(directory)
-            store.update_settings({"status_only_mode": True, "status_poll_interval_seconds": 3,
-                                   "status_request_timeout": 2, "sound_enabled": False,
+            store.update_settings({"status_only_mode": True, "status_poll_interval_seconds": 8,
+                                   "monitor_max_requests_per_second":20,
+                                   "status_request_timeout": request_timeout, "sound_enabled": False,
                                    "min_free_disk_gib": 0})
             added = store.add_rooms([{"platform": "wechat", "room_input": f"fixture-{i}",
                                       "record_enabled": False,
@@ -128,23 +132,26 @@ def run(duration, report_path):
             by_number = {int(r["room_input"].split("-")[1]): r["id"] for r in store.list_rooms()}
             engine = Engine(store)
             engine.start()
-            await_condition(engine, lambda s: all(r["live_status"] == "waiting" for r in s["rooms"]),
+            await_condition(engine, lambda s: all(r["room_status"] == "waiting" for r in s["rooms"]),
                             15, "150 real process probes did not warm up")
             report["cold_start_seconds"] = round(time.monotonic() - began, 3)
             switched = time.monotonic()
             with server.lock:
                 server.live = True
-            await_condition(engine, lambda s: all(r["live_status"] == "live" for r in s["rooms"]),
-                            5, "150 healthy status transitions exceeded 5 seconds")
+            await_condition(engine, lambda s: all(r["room_status"] == "live" for r in s["rooms"]),
+                            20, "150 healthy status transitions exceeded 20 seconds")
             report["healthy_transition_seconds"] = round(time.monotonic() - switched, 3)
             with server.lock:
                 server.faults = True
                 server.live = False
             healthy_ids = {rid for number, rid in by_number.items() if number >= 7}
             switched = time.monotonic()
-            state = await_condition(engine, lambda s: all(r["live_status"] == "waiting"
+            # Measure the confirmed transition itself. A room already proven
+            # offline can become stale while other rooms spend the global
+            # budget on confirmation; this must not undo that observation.
+            state = await_condition(engine, lambda s: all(r["room_status"] == "waiting"
                                     for r in s["rooms"] if r["id"] in healthy_ids),
-                                    5, "faulty rooms blocked healthy status transitions")
+                                    20, "faulty rooms blocked confirmed offline transitions beyond 20 seconds")
             report["mixed_fault_transition_seconds"] = round(time.monotonic() - switched, 3)
             state = await_condition(engine, lambda s: s["monitor"].get("probe_process_timeouts", 0) > 0
                                     or s["monitor"].get("process_timeouts", 0) > 0
@@ -160,7 +167,7 @@ def run(duration, report_path):
             recovered_ids = {by_number[n] for n in range(6)}
             await_condition(engine, lambda s: all(r["live_status"] == "live" and not r.get("status_stale", False)
                                     for r in s["rooms"] if r["id"] in recovered_ids),
-                            15, "timed-out processes did not recover")
+                            20, "timed-out processes did not recover")
             report["recovery_verified"] = True
             report["resource_start"] = system_health()
             next_sample = time.monotonic()
@@ -237,7 +244,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration", type=float, default=30, help="minimum total fixture runtime in seconds")
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--request-timeout", type=float, default=4,
+                        help="status request deadline in seconds (release default: 4; optional tuned profile: 2)")
     args = parser.parse_args()
     if not 0 <= args.duration <= 7 * 86400:
         parser.error("duration must be between 0 and 604800 seconds")
-    run(args.duration, args.report)
+    if not 2 <= args.request_timeout <= 15:
+        parser.error("request-timeout must be between 2 and 15 seconds")
+    run(args.duration, args.report, args.request_timeout)

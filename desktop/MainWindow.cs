@@ -136,7 +136,7 @@ internal sealed class MainWindow : Form
 			{
 				core = Process.Start(new ProcessStartInfo(runtime)
 				{
-					Arguments = "\"" + script + "\" --no-browser --data-dir \"" + data + "\" --owner-pid " + Process.GetCurrentProcess().Id,
+					Arguments = DesktopPaths.QuoteArgument(script) + " --no-browser --data-dir " + DesktopPaths.QuoteArgument(data) + " --owner-pid " + Process.GetCurrentProcess().Id,
 					WorkingDirectory = root,
 					UseShellExecute = false,
 					CreateNoWindow = true

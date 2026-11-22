@@ -31,7 +31,8 @@ $exeName = -join @([char]0x76F4, [char]0x64AD, [char]0x5B88, [char]0x671B)
 $exeName += '.exe'
 $outputExe = Join-Path $OutputDirectory $exeName
 $referenceNames = @('System.dll', 'System.Core.dll', 'System.Drawing.dll',
-    'System.Windows.Forms.dll', 'System.Net.Http.dll', 'System.Web.Extensions.dll')
+    'System.Windows.Forms.dll', 'System.Net.Http.dll', 'System.Web.Extensions.dll',
+    'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
 $references = @($referenceNames | ForEach-Object { Join-Path $frameworkRoot $_ })
 $references += Join-Path $projectRoot 'Microsoft.Web.WebView2.Core.dll'
 $references += Join-Path $projectRoot 'Microsoft.Web.WebView2.WinForms.dll'

@@ -1,5 +1,4 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-"%~dp0tools\python\python.exe" "%~dp0run.py" %*
-if errorlevel 1 pause
+start "" "%~dp0直播守望.exe" %*

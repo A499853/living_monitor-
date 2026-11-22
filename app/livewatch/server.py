@@ -161,7 +161,9 @@ class Handler(BaseHTTPRequestHandler):
                 room["resolved_stream_url"] = runtime.get("resolved_stream_url", "")
                 streams=runtime.get("stream_variants",[])
                 room_url=_source_url(room,runtime)
-                return self._reply(200, {"room": room,"streams":streams,"room_url":room_url})
+                return self._reply(200, {"room": room,"streams":streams,"room_url":room_url,
+                                         "source_refresh_pending":bool(runtime.get("source_refresh_pending")),
+                                         "last_check_finished_at":runtime.get("last_check_finished_at", "")})
             static = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
             if path in static:
                 filename, mime = static[path]
@@ -219,6 +221,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             limit = MAX_IMPORT_BODY if path == "/api/import" else MAX_BATCH_BODY if path == "/api/rooms/batch" else MAX_BODY
             body = self._body(limit)
+            if method == 'POST' and path.startswith('/api/room-source/') and path.endswith('/refresh'):
+                parts = path.strip('/').split('/')
+                if len(parts) != 4:
+                    raise ValueError('直播间选择无效。')
+                self.server.engine.request_sources(unquote(parts[2]))
+                return self._reply(200, {'ok': True, 'queued': True})
             if method == 'POST' and path == '/api/playback':
                 room = self.server.store.get_room(body.get('room_id', ''))
                 with self.server.engine.lock:

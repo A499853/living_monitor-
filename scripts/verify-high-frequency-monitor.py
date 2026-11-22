@@ -1,4 +1,4 @@
-"""Deterministic 150-room / 5-second scheduler acceptance check.
+"""150-room bounded scheduling and deterministic state-machine checks.
 
 This is an offline scheduling test.  The provider below behaves like a status
 endpoint with a bounded response time; no platform, login, or network is used.
@@ -59,7 +59,7 @@ class StatusProvider:
 
 
 class HighFrequencyChecks(unittest.TestCase):
-    def test_150_rooms_complete_one_wave_within_five_seconds(self):
+    def test_150_rooms_fixed_delay_with_request_budget(self):
         with tempfile.TemporaryDirectory(prefix="livewatch-150-") as directory:
             store = Store(Path(directory) / "状态压力测试")
             provider = StatusProvider()
@@ -67,7 +67,8 @@ class HighFrequencyChecks(unittest.TestCase):
             try:
                 store.update_settings({
                     "status_only_mode": True,
-                    "status_poll_interval_seconds": 5,
+                    "status_poll_interval_seconds": 8,
+                    "monitor_max_requests_per_second": 20,
                     "status_check_concurrency": 32,
                     "status_request_timeout": 4,
                     "monitor_batch_size": 3,
@@ -93,7 +94,7 @@ class HighFrequencyChecks(unittest.TestCase):
                 engine = Engine(store, providers=provider)
                 started = time.monotonic()
                 engine.start()
-                deadline = started + 4.5
+                deadline = started + 8.5
                 while time.monotonic() < deadline:
                     with provider.lock:
                         if len(provider.calls) >= 150 and provider.active == 0:
@@ -104,7 +105,7 @@ class HighFrequencyChecks(unittest.TestCase):
                     self.assertEqual(len(provider.calls), 150)
                     self.assertEqual(len(set(provider.calls)), 150)
                     self.assertLessEqual(provider.peak, 32)
-                self.assertLess(elapsed, 5.0)
+                self.assertLess(elapsed, 9.0)
                 # Future callbacks update Engine metrics just after the probe
                 # function releases its last slot.
                 metrics_deadline = time.monotonic() + 1
@@ -115,7 +116,7 @@ class HighFrequencyChecks(unittest.TestCase):
                 self.assertEqual(engine.snapshot()["monitor"]["effective_concurrency"], 32)
                 # Exercise the second cycle too: a fast first wave alone does
                 # not prove every room is scheduled every five seconds.
-                deadline=started+7
+                deadline=started+18
                 while time.monotonic()<deadline:
                     with provider.lock:
                         if all(len(starts)>=2 for starts in provider.starts.values()): break
@@ -124,8 +125,11 @@ class HighFrequencyChecks(unittest.TestCase):
                     self.assertEqual(len(provider.starts),150)
                     self.assertTrue(all(len(starts)>=2 for starts in provider.starts.values()))
                     gaps=[starts[1]-starts[0] for starts in provider.starts.values()]
-                self.assertGreaterEqual(min(gaps),4.95)
-                self.assertLess(max(gaps),5.5)
+                    starts=sorted(at for values in provider.starts.values() for at in values)
+                self.assertGreaterEqual(min(gaps),8.0)
+                self.assertLess(max(gaps),10.0)
+                # The budget covers the first wave and subsequent room cycles.
+                self.assertLessEqual(max(sum(at<=other<at+.99 for other in starts) for at in starts),20)
             finally:
                 if engine is not None:
                     engine.close()
@@ -207,6 +211,7 @@ class IndependentStatusChecks(unittest.TestCase):
     def configure(self,names,concurrency=2,official=True):
         self.store.update_settings({'status_only_mode':True,'status_poll_interval_seconds':5,
                                    'status_check_concurrency':concurrency,'status_douyin_concurrency':concurrency,
+                                   'monitor_max_requests_per_second':100,
                                    'monitor_schedule_mode':'batch','room_check_delay_seconds':60,
                                    'monitor_interval_minutes':1440,'sound_enabled':False,'min_free_disk_gib':0})
         rooms=[]
@@ -269,13 +274,18 @@ class IndependentStatusChecks(unittest.TestCase):
         self.configure(['one'])
         self.engine._tick(); self.finish('one',ProbeResult(True))
         self.assertEqual(self.engine.snapshot()['rooms'][0]['live_status'],'live')
-        self.clock.now+=6
+        self.clock.now+=10
         room=self.engine.snapshot()['rooms'][0]
         self.assertEqual(room['live_status'],'unknown')
         self.assertEqual(room['last_confirmed_status'],'live')
         self.assertTrue(room['status_stale'])
         self.assertFalse(any(event['kind']=='live_ended' for event in self.store.list_events()))
         self.engine._tick(); self.finish('one',ProbeResult(False),number=2)
+        room=self.engine.snapshot()['rooms'][0]
+        self.assertEqual(room['room_status'],'live')
+        self.assertTrue(room['pending_offline_confirmation'])
+        self.clock.now+=1
+        self.engine._tick(); self.finish('one',ProbeResult(False),number=3)
         room=self.engine.snapshot()['rooms'][0]
         self.assertEqual(room['live_status'],'waiting')
         self.assertFalse(room['status_stale'])
@@ -350,6 +360,108 @@ class IndependentStatusChecks(unittest.TestCase):
         self.engine._tick(); self.finish('one',ProbeResult(True),number=3)
         self.assertEqual(self.engine.snapshot()['rooms'][0]['live_status'],'live')
         self.assertFalse(self.engine.snapshot()['rooms'][0]['status_stale'])
+
+    def test_period_begins_after_slow_request_finishes_and_reports_actual_interval(self):
+        self.configure(['one'])
+        self.engine._tick(); self.provider.wait_call('one')
+        self.clock.now+=4
+        self.finish('one',ProbeResult(True))
+        self.clock.now+=4.9
+        self.engine._tick()
+        self.assertEqual(len(self.provider.calls),1)
+        self.clock.now+=.1
+        self.engine._tick(); self.finish('one',ProbeResult(True),number=2)
+        room=self.engine.snapshot()['rooms'][0]
+        self.assertEqual(room['last_actual_check_interval_seconds'],9)
+        self.assertEqual(self.engine.snapshot()['monitor']['actual_check_interval_p95_seconds'],9)
+        self.assertTrue(room['last_check_finished_at'])
+
+    def test_error_interrupts_offline_confirmation_without_ending_session(self):
+        self.configure(['one'],official=False)
+        self.engine._tick(); self.finish('one',ProbeResult(True))
+        self.engine.refresh(); self.engine._tick(); self.finish('one',ProbeResult(False),number=2)
+        self.clock.now+=1
+        self.engine._tick(); self.finish('one',ProbeResult(None,error_code='network_error'),number=3)
+        room=self.engine.snapshot()['rooms'][0]
+        self.assertEqual(room['room_status'],'live')
+        self.assertEqual(room['live_status'],'unknown')
+        self.assertFalse(room['pending_offline_confirmation'])
+        self.clock.now+=1
+        self.engine._tick(); self.finish('one',ProbeResult(False),number=4)
+        self.assertEqual(self.engine.snapshot()['rooms'][0]['room_status'],'live')
+        self.assertFalse(any(e['kind']=='live_ended' for e in self.store.list_events()))
+        self.clock.now+=1
+        self.engine._tick(); self.finish('one',ProbeResult(False),number=5)
+        self.assertEqual(self.engine.snapshot()['rooms'][0]['room_status'],'waiting')
+        self.assertEqual(sum(e['kind']=='live_ended' for e in self.store.list_events()),1)
+
+    def test_global_request_budget_counts_fast_failures_and_retries(self):
+        self.configure(['a','b','c','d'],concurrency=4)
+        self.store.update_settings({'monitor_max_requests_per_second':2})
+        self.engine._tick()
+        self.finish('a',ProbeResult(None,error_code='network_error'))
+        self.finish('b',ProbeResult(None,error_code='network_error'))
+        for _ in range(10): self.engine._tick()
+        self.assertEqual(len(self.provider.calls),2)
+        self.clock.now+=1
+        self.engine._tick()
+        self.assertEqual(len(self.engine.pending),2)
+        self.assertEqual(len(self.engine.rate_window),2)
+        self.assertLessEqual(self.provider.peak,2)
+
+    def test_parse_failure_preserves_confirmed_room_and_retries_in_five_seconds(self):
+        self.configure(['one'])
+        self.engine._tick(); self.finish('one',ProbeResult(True))
+        self.engine.refresh(); self.engine._tick()
+        self.finish('one',ProbeResult(None,error_code='parse_error'),number=2)
+        room=self.engine.snapshot()['rooms'][0]
+        self.assertEqual(room['room_status'],'live')
+        self.assertEqual(room['live_status'],'unknown')
+        self.assertTrue(room['last_success_at'])
+        self.clock.now+=5
+        self.engine._tick(); self.finish('one',ProbeResult(True),number=3)
+        self.assertEqual(self.engine.snapshot()['rooms'][0]['live_status'],'live')
+
+    def test_source_refresh_is_queued_behind_status_request_without_overlap(self):
+        self.configure(['one'],official=False)
+        self.engine._tick(); self.provider.wait_call('one')
+        self.assertTrue(self.engine.request_sources(self.rooms['one']['id'])['queued'])
+        self.assertTrue(self.engine.snapshot()['rooms'][0]['source_refresh_pending'])
+        self.engine._tick()
+        self.assertEqual(len(self.provider.calls),1)
+        self.finish('one',ProbeResult(True))
+        self.engine._tick()
+        refresh=self.provider.wait_call('one',2)
+        self.assertFalse(refresh['settings']['_status_only'])
+        self.assertEqual(refresh['settings']['_probe_deadline']-self.clock.now,4)
+        self.engine.request_sources(self.rooms['one']['id'])
+        self.finish('one',ProbeResult(True,stream_url='https://media.invalid/stream.m3u8'),number=2)
+        self.assertFalse(self.engine.snapshot()['rooms'][0]['source_refresh_pending'])
+        self.engine._tick()
+        self.assertEqual(len(self.provider.calls),2)
+        self.assertEqual(self.provider.peak_per_room,1)
+
+    def test_exhausted_network_recovery_ignores_legacy_advisory_retry(self):
+        self.configure(['one'],official=False)
+        self.engine._tick()
+        self.finish('one',ProbeResult(None,error_code='network_error',retry_after=30))
+        self.clock.now+=11
+        self.engine._tick()
+        self.clock.now+=5
+        self.engine._tick(); self.finish('one',ProbeResult(True),number=2)
+        self.assertEqual(self.engine.snapshot()['rooms'][0]['room_status'],'live')
+
+    def test_disabling_then_reenabling_discards_previous_inflight_result(self):
+        self.configure(['one'])
+        rid=self.rooms['one']['id']
+        self.engine._tick(); self.provider.wait_call('one')
+        self.store.update_room(rid,{'monitor_enabled':False}); self.engine.room_changed(rid)
+        self.store.update_room(rid,{'monitor_enabled':True}); self.engine.room_changed(rid)
+        self.finish('one',ProbeResult(True))
+        self.assertEqual(self.engine.snapshot()['rooms'][0]['room_status'],'unknown')
+        self.engine._tick(); self.finish('one',ProbeResult(False),number=2)
+        self.assertEqual(self.engine.snapshot()['rooms'][0]['room_status'],'waiting')
+        self.assertFalse(any(e['kind']=='live_started' for e in self.store.list_events()))
 
 
 if __name__ == "__main__":

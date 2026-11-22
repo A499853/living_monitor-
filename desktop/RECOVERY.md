@@ -14,7 +14,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
 
 脚本使用 Windows 自带的 `.NET Framework` x64 C# 5 编译器，以及根目录已恢复的 WebView2 SDK DLL，无需下载、安装 SDK 或访问网络。目标运行环境为 Windows 10 22H2 / Windows 11 x64、.NET Framework 4.8。产物写入 `build/desktop/`；不会默认替换项目根目录 EXE。
 
-该宿主保留原来的路径规则：程序资源 `app/`、`tools/python/`、`tools/webview2/` 必须与 EXE 在同一个根目录。`--data-dir` 仅指定数据目录，不会更改资源目录。直接双击仅含构建产物的目录中的 EXE 会因缺少这些资源而失败。
+该宿主保留原来的路径规则：程序资源 `app/` 与 EXE 在同一个根目录。2026-11-22 增加了首次启动依赖准备：缺少 `tools/python/`、`tools/ffmpeg.exe`、`tools/webview2/` 时，从随包清单的固定 HTTPS 地址自动下载并校验 SHA-256，在 EXE 目录安装后继续启动。`--data-dir` 仅指定数据目录，不会更改资源目录。仅复制 EXE 仍不构成完整交付；轻量包必须包含 `app/`、清单和 SDK DLL。
+
+轻量 ZIP 用 `scripts/build-portable.ps1` 生成，故障回归用 `scripts/verify-portable-bootstrap.ps1` 验证；详见根目录 `portable-delivery.md`。原始版本行为和历史验证记录保留如下。
 
 若要用恢复后的源码版本运行，先正常退出直播守望，再执行：
 

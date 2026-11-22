@@ -14,15 +14,26 @@ internal static class Launcher
 	[STAThread]
 	private static void Main(string[] args)
 	{
-		string text = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
-		string text2 = text;
-		for (int i = 0; i + 1 < args.Length; i++)
+		string text = DesktopPaths.NormalizeDirectory(AppDomain.CurrentDomain.BaseDirectory);
+		if (Array.IndexOf(args, "--prepare-dependencies") >= 0)
 		{
-			if (args[i] == "--data-dir")
+			try
 			{
-				text2 = Path.GetFullPath(args[++i]);
+				DependencyBootstrapper.Prepare(text, delegate(string message)
+				{
+					Directory.CreateDirectory(Path.Combine(text, "logs"));
+					File.AppendAllText(Path.Combine(text, "logs", "bootstrap.log"), DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine, Encoding.UTF8);
+				}, CancellationToken.None);
+				Environment.ExitCode = 0;
 			}
+			catch (Exception ex)
+			{
+				try { Directory.CreateDirectory(Path.Combine(text, "logs")); File.AppendAllText(Path.Combine(text, "logs", "bootstrap.log"), ex + Environment.NewLine); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+				Environment.ExitCode = 1;
+			}
+			return;
 		}
+		string text2 = DesktopPaths.DataDirectory(text, args);
 		string text3;
 		using (SHA256 sHA = SHA256.Create())
 		{
@@ -49,6 +60,16 @@ internal static class Launcher
 					}
 					Application.EnableVisualStyles();
 					Application.SetCompatibleTextRenderingDefault(false);
+					if (!File.Exists(Path.Combine(text, "app", "run.py")))
+						throw new FileNotFoundException("缺少 app/run.py，请完整解压交付 ZIP 后再运行。");
+					if (DependencyBootstrapper.NeedsPreparation(text))
+					{
+						using (var preparation = new DependencyWindow(text))
+						{
+							Application.Run(preparation);
+							if (!preparation.Succeeded) return;
+						}
+					}
 					MainWindow window = new MainWindow(text, text2);
 					try
 					{
@@ -83,7 +104,7 @@ internal static class Launcher
 				}
 				catch (Exception ex2)
 				{
-					MessageBox.Show("无法打开软件窗口，请完整解压到可写文件夹。\n" + ex2.GetType().Name, "直播守望", MessageBoxButtons.OK, MessageBoxIcon.Hand);
+					MessageBox.Show("无法打开软件窗口，请完整解压到可写文件夹。\n" + ex2.Message, "直播守望", MessageBoxButtons.OK, MessageBoxIcon.Hand);
 				}
 				finally
 				{
