@@ -28,9 +28,9 @@ Start-Process -FilePath '.\直播守望.exe' -ArgumentList '--prepare-dependenci
 
 ## 启动链路验证（2026-11-22）
 
-- 19 项启动器回归断言通过，包括盘根和带空格目录、Windows 参数传递、相同数据目录共用实例锁、校验错误、缺失文件、篡改文件大小、损坏的安装收据、ZIP 路径越界、取消、安装失败保留原目录及成功替换；新增验证包内 FFmpeg 无需下载或安装收据即可复用。
+- 25 项启动器回归断言通过，包括盘根和带空格目录、Windows 参数传递、相同数据目录共用实例锁、校验错误、缺失文件、篡改文件大小、损坏的安装收据、ZIP 路径越界、取消、安装失败保留原目录及成功替换；验证包内 FFmpeg 无需下载或安装收据即可复用，工作目录不同于 EXE 位置时仍在 EXE 同目录准备并复用依赖。
 - 早期未内置 FFmpeg 的启动链路测试在 `build/bootstrap-smoke/` 的空 `tools/` 目录实际联网下载三个依赖并完成 SHA-256 校验及解压。FFmpeg 下载到 86% 时强制结束测试进程，再启动后从 86% 继续，最终校验通过。当前交付包已内置 FFmpeg，不依赖该下载步骤。
 - 使用下载的 Python 成功导入 SSL、SQLite 等标准库，下载的 FFmpeg 正确报告 7.1。使用这些运行库启动实际桌面 EXE，健康接口返回 `LiveWatch 2.8.0`，宿主加载了本地 `WebView2Loader.dll` 和 `EmbeddedBrowserWebView.dll`。
 - 通过本地退出接口关闭隔离测试实例，窗口、后端和浏览器进程均退出，实例文件移除。第二次依赖准备退出码为 0，直接复用三个运行库，没有再次下载。
 
-可读验证记录在开发目录 `artifacts/portable-bootstrap-report.json`，原始下载进度在 `build/bootstrap-smoke/logs/bootstrap.log`。这验证了当前机器上的交付启动链路；没有代替不同 Windows 版本、代理网络和全天录制的实际验收。
+最新桌面隔离验证记录在 `artifacts/portable-desktop-current-report.json`：使用固定运行库、系统 PATH 无 Python/浏览器，真实桌面窗口成功打开，数据和 WebView 模块位于 EXE 同目录；正常退出后隔离实例无残留进程。最新 ZIP 文件清单与哈希核验在 `artifacts/delivery-package-report.json`。历史真实下载记录在 `artifacts/portable-bootstrap-report.json`，原始下载进度在 `build/bootstrap-smoke/logs/bootstrap.log`。这验证了当前机器上的交付启动链路；没有代替不同 Windows 版本、代理网络和全天录制的实际验收。

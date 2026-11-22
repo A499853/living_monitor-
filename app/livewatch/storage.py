@@ -195,6 +195,8 @@ class Store:
         with self.lock:
             result=dict(self.DEFAULTS)
             result.update({r[0]:json.loads(r[1]) for r in self.db.execute('SELECT key,value FROM settings')})
+            timeout=result.get('status_request_timeout',4)
+            result['status_request_timeout']=max(2,min(4,timeout)) if type(timeout) in (int,float) and math.isfinite(timeout) else 4
             return result
     def update_settings(self,payload):
         if not isinstance(payload,dict) or set(payload)-set(self.DEFAULTS): raise ValueError('无效的设置字段')
@@ -221,7 +223,7 @@ class Store:
                 count=value[key]
                 if isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=maximum:
                     raise ValueError(f'{label}必须为 1～{maximum} 之间的整数')
-        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,15,'高频状态请求超时'),('monitor_max_requests_per_second',1,100,'全局每秒检查上限'),('record_segment_seconds',60,86400,'录制分段时长'),('record_stall_seconds',10,300,'录制停滞期限'),('record_start_timeout_seconds',10,120,'录制启动期限')]:
+        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,4,'高频状态请求超时'),('monitor_max_requests_per_second',1,100,'全局每秒检查上限'),('record_segment_seconds',60,86400,'录制分段时长'),('record_stall_seconds',10,300,'录制停滞期限'),('record_start_timeout_seconds',10,120,'录制启动期限')]:
             if key in value:
                 number=value[key]
                 if isinstance(number,bool) or not isinstance(number,(int,float)) or not math.isfinite(number) or not lo<=number<=hi:

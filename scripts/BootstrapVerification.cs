@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Threading;
+using System.Web.Script.Serialization;
 
 internal static class BootstrapVerification
 {
@@ -26,6 +27,62 @@ internal static class BootstrapVerification
     {
         try { typeof(DependencyBootstrapper).GetMethod("Install", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { root, package, archive, CancellationToken.None }); }
         catch (TargetInvocationException ex) { throw ex.InnerException; }
+    }
+    private static Dictionary<string, object> Descriptor(string archive, string filename)
+    {
+        string digest;
+        using (var hash = SHA256.Create())
+        using (var file = File.OpenRead(archive)) digest = BitConverter.ToString(hash.ComputeHash(file)).Replace("-", "").ToLowerInvariant();
+        return new Dictionary<string, object> {
+            { "url", "https://example.invalid/" + filename }, { "file", filename },
+            { "size", new FileInfo(archive).Length }, { "sha256", digest }
+        };
+    }
+    private static void VerifyPortablePreparation(string root)
+    {
+        string installation = Path.Combine(root, "portable installation");
+        string otherWorkingDirectory = Path.Combine(root, "unrelated working directory");
+        string cache = Path.Combine(installation, "tools", ".downloads");
+        Directory.CreateDirectory(cache);
+        Directory.CreateDirectory(otherWorkingDirectory);
+        string pythonArchive = Path.Combine(cache, "python.zip");
+        var pythonFiles = new Dictionary<string, string>();
+        foreach (string name in new[] { "python.exe", "pythonw.exe", "python312.dll", "python312.zip", "python312._pth", "_ssl.pyd", "_sqlite3.pyd" })
+            pythonFiles[name] = "offline fixture " + name;
+        Zip(pythonArchive, pythonFiles);
+        var descriptor = Descriptor(pythonArchive, "python.zip");
+        var serializer = new JavaScriptSerializer();
+        File.WriteAllText(Path.Combine(installation, "dependency-manifest.json"), serializer.Serialize(new Dictionary<string, object> {
+            { "python", descriptor }, { "ffmpeg", descriptor }
+        }));
+        File.WriteAllText(Path.Combine(installation, "desktop-dependency-manifest.json"), serializer.Serialize(new Dictionary<string, object> {
+            { "webview2_runtime", descriptor }
+        }));
+        // Runtime fixtures stand in only for already-bundled dependencies;
+        // the Python archive exercises the real preparation/install path.
+        using (var bundled = File.Create(Path.Combine(installation, "tools", "ffmpeg.exe"))) bundled.SetLength(1000001);
+        string browser = Path.Combine(installation, "tools", "webview2");
+        foreach (string relative in new[] { "msedgewebview2.exe", "msedge.dll", "icudtl.dat", "resources.pak", "EBWebView/x64/EmbeddedBrowserWebView.dll" })
+        {
+            string file = Path.Combine(browser, relative.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(file));
+            File.WriteAllText(file, "offline fixture");
+        }
+        Check(DependencyBootstrapper.NeedsPreparation(installation), "fresh portable installation detects missing embedded Python");
+        string previousWorkingDirectory = Environment.CurrentDirectory;
+        var messages = new List<string>();
+        try
+        {
+            Environment.CurrentDirectory = otherWorkingDirectory;
+            DependencyBootstrapper.Prepare(installation, messages.Add, CancellationToken.None);
+        }
+        finally { Environment.CurrentDirectory = previousWorkingDirectory; }
+        Check(!DependencyBootstrapper.NeedsPreparation(installation), "cached verified dependency installs into the executable directory");
+        Check(!Directory.Exists(Path.Combine(otherWorkingDirectory, "tools")), "dependency preparation is independent of the process working directory");
+        Check(File.ReadAllText(Path.Combine(installation, "tools", "python", "python312._pth")).Contains("../../app"), "fresh portable Python resolves the adjacent application source");
+        Check(!File.Exists(pythonArchive), "verified archive cache is removed after successful preparation");
+        DependencyBootstrapper.Prepare(installation, messages.Add, CancellationToken.None);
+        Check(!DependencyBootstrapper.NeedsPreparation(installation), "second preparation reuses installed dependencies with no reachable download URL");
     }
     private static int Main(string[] args)
     {
@@ -98,6 +155,7 @@ internal static class BootstrapVerification
             bool cancelled = false;
             try { DependencyBootstrapper.Download(package, Path.Combine(root, "cancelled.zip"), delegate { }, cancellation.Token); } catch (OperationCanceledException) { cancelled = true; }
             Check(cancelled && !File.Exists(Path.Combine(root, "cancelled.zip.partial")), "cancelled download does not create a partial runtime");
+            VerifyPortablePreparation(root);
             Console.WriteLine("PASS " + assertions + " bootstrap assertions");
             return 0;
         }

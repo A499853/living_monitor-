@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from dataclasses import fields
+from datetime import datetime
 import json
 import math
 import os
@@ -183,7 +184,10 @@ class ProbePool:
         with self._lock:
             if self._closed.is_set():
                 raise RuntimeError('cannot schedule new futures after shutdown')
-            return self._executor.submit(self._run, function, dict(room), dict(settings))
+            timing={'started_at':None,'started_iso':'','response_at':None}
+            future=self._executor.submit(self._run, function, dict(room), dict(settings),timing)
+            future.probe_timing=timing
+            return future
 
     def _acquire_worker(self, deadline):
         while True:
@@ -241,13 +245,24 @@ class ProbePool:
         # Re-evaluate it without sending a request through an excess child.
         return self._acquire_worker(deadline)
 
-    def _run(self, function, room, settings):
+    def _run(self, function, room, settings,timing=None):
         if self._closed.is_set():
             return _failure(stopped=True)
         with self._lock:
             isolated = self._isolation_enabled and settings.get('monitor_process_isolation', True)
+        budget=settings.get('_probe_budget_seconds')
+        budget=budget if type(budget) in (int,float) and math.isfinite(budget) and 0<budget<=4 else None
+        def started():
+            at=time.monotonic()
+            if timing is not None: timing.update(started_at=at,started_iso=datetime.now().astimezone().isoformat(timespec='seconds'))
+            if budget is not None: settings['_probe_deadline']=at+budget
+            return settings.get('_probe_deadline')
+        def completed(result):
+            if timing is not None: timing['response_at']=time.monotonic()
+            return result
         if not isolated:
-            return function(room, settings)
+            started()
+            return completed(function(room, settings))
         deadline = settings.get('_probe_deadline')
         if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
                 or not math.isfinite(deadline)):
@@ -259,12 +274,25 @@ class ProbePool:
             settings['_probe_deadline'] = deadline
         worker = None
         try:
-            worker = self._acquire_worker(deadline)
+            if budget is not None:
+                # Queue/process-capacity waiting is not a platform check. Give
+                # its network operation a fresh bounded budget once leased.
+                while not self._closed.is_set():
+                    try:
+                        worker=self._acquire_worker(time.monotonic()+1)
+                        break
+                    except TimeoutError: continue
+            else:
+                worker = self._acquire_worker(deadline)
             if worker is None:
-                return _failure(stopped=True) if self._closed.is_set() else function(room, settings)
+                if self._closed.is_set(): return _failure(stopped=True)
+                started()
+                return completed(function(room, settings))
+            actual_deadline=started()
+            if budget is not None: deadline=actual_deadline
             if time.monotonic() >= deadline:
                 raise TimeoutError()
-            return worker.exchange(room, settings, deadline)
+            return completed(worker.exchange(room, settings, deadline))
         except (TimeoutError, OSError, ValueError, TypeError, RecursionError, queue.Full) as exc:
             timed_out = isinstance(exc, TimeoutError)
             with self._lock:

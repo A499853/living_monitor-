@@ -128,6 +128,20 @@ class ProbePoolChecks(unittest.TestCase):
         self.assertNotEqual(self.workers()[0].process.pid,old.process.pid)
         self.assertIsNotNone(old.process.poll())
 
+    def test_relative_probe_budget_starts_after_executor_queue(self):
+        self.assertIs(self.submit().result(timeout=5).live,False)
+        entered=threading.Event(); release=threading.Event()
+        self.addCleanup(release.set)
+        blocker=self.pool._executor.submit(lambda:(entered.set(),release.wait(3)))
+        self.assertTrue(entered.wait(1))
+        future=self.submit(seconds=.1,_probe_budget_seconds=1)
+        time.sleep(.2)
+        self.assertIsNone(future.probe_timing['started_at'])
+        self.assertFalse(future.done())
+        release.set(); blocker.result(timeout=2)
+        self.assertIs(future.result(timeout=3).live,False)
+        self.assertIsNotNone(future.probe_timing['started_at'])
+
     def test_slow_loopback_endpoint_respects_total_deadline(self):
         # Measure the network deadline independently of cold process startup,
         # which can consume the short budget under parallel suite load.
