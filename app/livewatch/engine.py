@@ -8,7 +8,8 @@ from .providers import start_time_priority, monitor_error_message, sanitize_prob
 from .auth import cookie_is_authorized
 from .maintenance import Maintenance
 
-CHECK_TIMEOUT_SECONDS=4
+DEFAULT_CHECK_TIMEOUT_SECONDS=4
+MAX_CHECK_TIMEOUT_SECONDS=60
 
 class Engine:
     def __init__(self,store,providers=None,recorder=None):
@@ -50,6 +51,7 @@ class Engine:
         self.recoveries={}
         self.discarded_probes=set()
         self.timed_out_probes=set()
+        self.draining_probes={}
         self.due={}
         self.status_last_started={}
         self.status_last_finished={}
@@ -124,7 +126,7 @@ class Engine:
                                     _persisted_success_at=previous.get('last_success_at',''))
             self.states[rid].update(last_check_finished_at='',last_actual_check_interval_seconds=None,
                                     detection_uncertain=True,offline_checks=0,monitor_recovering=False,
-                                    check_started_at='')
+                                    check_started_at='',timeout_retry_step=0,timeout_retry_yield_count=0,timeout_retry_remaining=0)
             self._queue_end_metadata(room)
         return self.states[rid]
 
@@ -186,7 +188,7 @@ class Engine:
                     wake_times=[self._status_due_at(rid,settings) for rid,state in self.states.items()
                                 if state['source_room']['monitor_enabled'] and rid not in self.pending and rid not in self.recoveries]
                     wake_times.extend(rescue['next_at'] for rid,rescue in self.recoveries.items() if rid not in self.pending)
-                    wake_times.extend(self._check_started(submitted)+CHECK_TIMEOUT_SECONDS for submitted in self.pending.values()
+                    wake_times.extend(self._check_started(submitted)+self._check_budget(submitted) for submitted in self.pending.values()
                                       if self._check_started(submitted) is not None and submitted[0] not in self.timed_out_probes)
                     # A fleet's first wave is limited by the shared one-second
                     # budget, not by any room timer. Wake exactly when its next
@@ -202,7 +204,7 @@ class Engine:
             with self.lock:
                 now=time.monotonic()
                 until_next=self._next_dispatch_at(settings)-now
-                pending_deadlines=[self._check_started(submitted)+CHECK_TIMEOUT_SECONDS-now for submitted in self.pending.values()
+                pending_deadlines=[self._check_started(submitted)+self._check_budget(submitted)-now for submitted in self.pending.values()
                                    if self._check_started(submitted) is not None and submitted[0] not in self.timed_out_probes]
                 if pending_deadlines: until_next=min(([until_next] if until_next>0 else [.4])+pending_deadlines)
             self.wake.wait(min(.4,until_next) if until_next>0 else .4); self.wake.clear()
@@ -240,10 +242,14 @@ class Engine:
                     if rid in self.pending: self.discarded_probes.add(self.pending[rid][0])
                     if rid in self.metadata_pending: self.discarded_metadata.add(self.metadata_pending[rid][0])
                     state.update(live_status='disabled',monitor_recovering=False)
+                    self._clear_timeout_retry(state)
                     self._stop_record(rid,room)
                     continue
                 if (not settings.get('status_only_mode',True) and state.get('_offline_recheck_at') is not None
                         and time.monotonic()>=state['_offline_recheck_at']):
+                    self._enqueue_checks([rid])
+                if (not settings.get('status_only_mode',True) and state.get('_timeout_yield_waiting')
+                        and rid not in self.draining_probes):
                     self._enqueue_checks([rid])
                 if not room['record_enabled']: self._stop_record(rid,room)
                 elif state['confirmed_live'] is True and state.get('resolved_stream_url') and state['live_status']=='live':
@@ -260,6 +266,7 @@ class Engine:
             self._metadata_eligible=eligible
             now=time.monotonic()
             self._expire_recoveries(now)
+            self._release_yield_deadlock(eligible,settings,now)
             # Use freshly validated rooms for this turn. Give metadata one
             # opportunity every five seconds so status traffic cannot starve it.
             if getattr(self.providers,'paced_requests',False) and (self.metadata_last_submitted is None or now-self.metadata_last_submitted>=5):
@@ -287,8 +294,9 @@ class Engine:
                 if independent and time.monotonic()<self._next_dispatch_at(settings): break
                 # Configuration/auth changes may queue a fresh check while an
                 # obsolete request still owns its slot. Never overlap a room.
-                if rid in self.pending or rid in self.recoveries: continue
+                if rid in self.pending or rid in self.recoveries or rid in self.draining_probes: continue
                 room=eligible[rid]
+                if self.states[rid].get('timeout_retry_remaining',0)>0: continue
                 # Restrictions defer this room to a later round, without holding
                 # healthy or custom sources behind it in the queue.
                 if now<self.due.get(rid,0):
@@ -303,10 +311,10 @@ class Engine:
                 self.round_queue.remove(rid)
                 self.due[rid]=0
                 submitted_at=time.monotonic()
-                timeout=self._probe_timeout(settings,room)
+                timeout=self._probe_timeout(settings,room,full_source=bool(self._state(room).get('_source_refresh_requested')))
                 probe_settings=self._probe_settings(room,settings,submitted_at+timeout)
                 future=self.pool.submit(self.providers.check,dict(room),probe_settings)
-                self.pending[rid]=(future,self._identity(room),self.auth_generation,submitted_at)
+                self.pending[rid]=(future,self._identity(room),self.auth_generation,submitted_at,probe_settings['_probe_budget_seconds'])
                 self._record_submission(room,submitted_at)
                 self.last_probe_submitted_at=submitted_at
                 self.last_dispatch_was_recovery=False
@@ -333,6 +341,10 @@ class Engine:
             regular=state['_offline_recheck_at']
         elif state.get('_error_recheck_at') is not None:
             regular=state['_error_recheck_at']
+        if state.get('_timeout_yield_waiting'):
+            # Completed yields make a timeout retry eligible immediately. Only
+            # true platform cooldowns still impose time, not the polling timer.
+            regular=state.get('_timeout_eligible_at',0)
         return max(regular,self.due.get(rid,0))
 
     def _request_budget_available(self,settings,now):
@@ -342,6 +354,10 @@ class Engine:
 
     def _record_submission(self,room,submitted_at):
         state=self._state(room)
+        # Dispatch consumes this particular yield wait. Keep its sequence for
+        # another timeout, but a different failure must use its own retry delay.
+        state.pop('_timeout_yield_waiting',None)
+        state.pop('_timeout_eligible_at',None)
         previous=state.get('_last_attempt_monotonic')
         if previous is not None:
             interval=max(0,submitted_at-previous)
@@ -351,6 +367,11 @@ class Engine:
         self.status_last_started[room['id']]=submitted_at
         self.probe_started_times.append(submitted_at)
         self.rate_window.append(submitted_at)
+        for other_id,other in self.states.items():
+            if other_id!=room['id'] and other.get('_timeout_yield_waiting') and other.get('timeout_retry_remaining',0)>0:
+                other['timeout_retry_remaining']-=1
+                if other['timeout_retry_remaining']==0: other['_timeout_eligible_at']=submitted_at
+                other['status_note']=f"检查超时，恢复中；让出 {other['timeout_retry_yield_count']} 次检查机会，剩余 {other['timeout_retry_remaining']} 次"
         if self._paced_room(room): self._reserve_douyin_request(submitted_at)
         state['last_attempt_at']=now_iso()
         state['check_started_at']=state['last_attempt_at']
@@ -359,7 +380,7 @@ class Engine:
         state=self._state(room)
         refresh=bool(state.pop('_source_refresh_requested',False))
         state['source_refreshing']=refresh
-        return dict(settings,_probe_deadline=deadline,_probe_budget_seconds=max(.01,min(CHECK_TIMEOUT_SECONDS,deadline-time.monotonic())),
+        return dict(settings,_probe_deadline=deadline,_probe_budget_seconds=max(.01,min(MAX_CHECK_TIMEOUT_SECONDS,deadline-time.monotonic())),
                     _status_page_not_before=state.get('_status_page_not_before',0),
                     _status_page_requested=state.get('_status_page_requested',False),
                     _status_single_request=True,
@@ -384,16 +405,18 @@ class Engine:
         for rid in ordered:
             if len(self.pending)>=self.max_concurrent_checks: break
             if not self._request_budget_available(settings,time.monotonic()): break
-            if rid in self.pending or rid in self.recoveries: continue
+            if rid in self.pending or rid in self.recoveries or rid in self.draining_probes: continue
             if now<self._status_due_at(rid,settings): continue
             room=eligible[rid]
+            if self.states[rid].get('timeout_retry_remaining',0)>0: continue
             if self._adaptive_room(room):
                 if now<self.douyin_blocked_until or self.douyin_recovery_rid or not self._platform_slot_available(settings): continue
                 if self.douyin_blocked_until: self.douyin_recovery_rid=rid
             submitted_at=time.monotonic()
-            probe_settings=self._probe_settings(room,settings,submitted_at+self._probe_timeout(settings,room))
+            timeout=self._probe_timeout(settings,room,full_source=bool(self._state(room).get('_source_refresh_requested')))
+            probe_settings=self._probe_settings(room,settings,submitted_at+timeout)
             future=self.pool.submit(self.providers.check,dict(room),probe_settings)
-            self.pending[rid]=(future,self._identity(room),self.auth_generation,submitted_at)
+            self.pending[rid]=(future,self._identity(room),self.auth_generation,submitted_at,probe_settings['_probe_budget_seconds'])
             self._record_submission(room,submitted_at)
             self.last_probe_submitted_at=submitted_at
             self.last_dispatch_was_recovery=False
@@ -548,13 +571,10 @@ class Engine:
             self.store.append_event('live_end_metadata',room,'已补充本场抖音下播时间（平台时间）')
 
     @staticmethod
-    def _probe_timeout(settings,room):
-        if settings.get('status_only_mode',True):
-            # Status-only probes have no reason to wait for a page or media
-            # body.  A short absolute deadline is what keeps a dead endpoint
-            # from making the next 5-second wave stale.
-            return max(2,min(CHECK_TIMEOUT_SECONDS,float(settings.get('status_request_timeout',4))))
-        return CHECK_TIMEOUT_SECONDS
+    def _probe_timeout(settings,room,full_source=False):
+        key='status_request_timeout' if settings.get('status_only_mode',True) and not full_source else 'request_timeout'
+        fallback=DEFAULT_CHECK_TIMEOUT_SECONDS if key=='status_request_timeout' else 12
+        return max(2,min(MAX_CHECK_TIMEOUT_SECONDS,float(settings.get(key,fallback))))
     def _platform_slot_available(self,settings):
         # Submitted source identities survive deletion or edits, so an obsolete
         # official request keeps consuming the platform's real request budget.
@@ -595,14 +615,14 @@ class Engine:
             self.store.append_event('monitor_rebuilt',room,'持续异常，已重建监控连接和访客会话；保留直播场次、授权和录制任务，冷却后重新检查。')
     def _fresh_checks_waiting(self,eligible,settings,now):
         if settings.get('status_only_mode',True):
-            return any(rid not in self.pending and rid not in self.recoveries
+            return any(rid not in self.pending and rid not in self.recoveries and rid not in self.draining_probes
                        and now>=self._status_due_at(rid,settings)
                        and (not self._adaptive_room(room) or
                             (now>=self.douyin_blocked_until and not self.douyin_recovery_rid and self._platform_slot_available(settings)))
                        for rid,room in eligible.items())
         for rid in self.round_queue:
             room=eligible.get(rid)
-            if room is None or rid in self.pending or rid in self.recoveries or now<self.due.get(rid,0): continue
+            if room is None or rid in self.pending or rid in self.recoveries or rid in self.draining_probes or now<self.due.get(rid,0): continue
             if not self._adaptive_room(room) or (now>=self.douyin_blocked_until and not self.douyin_recovery_rid and self._platform_slot_available(settings)):
                 return True
         return False
@@ -622,7 +642,9 @@ class Engine:
         ids=list(dict.fromkeys(rid for rid in ids if include_pending or rid not in self.pending and rid not in self.recoveries))
         if not ids: return
         if self.store.get_settings().get('status_only_mode',True):
-            for rid in ids: self.status_last_started.pop(rid,None)
+            for rid in ids:
+                if not self.states.get(rid,{}).get('_timeout_yield_waiting'):
+                    self.status_last_started.pop(rid,None)
             return
         if not self.round_active:
             self.round_active=True
@@ -638,41 +660,120 @@ class Engine:
     def _check_started(submitted):
         timing=getattr(submitted[0],'probe_timing',None)
         return timing.get('started_at') if timing is not None else submitted[3] if len(submitted)>3 else None
+    @staticmethod
+    def _check_budget(submitted):
+        # Every dispatch freezes its own budget. Editing settings never moves
+        # the deadline of a check that is already queued or running.
+        return submitted[4] if len(submitted)>4 else DEFAULT_CHECK_TIMEOUT_SECONDS
+    @staticmethod
+    def _clear_timeout_retry(state):
+        state.update(timeout_retry_step=0,timeout_retry_yield_count=0,timeout_retry_remaining=0)
+        for key in ('_timeout_fallback_at','_timeout_eligible_at','_timeout_yield_waiting'):
+            state.pop(key,None)
+    def _release_yield_deadlock(self,eligible,settings,now):
+        """Let one normally-due room retry when no other room can advance it."""
+        candidates=[]
+        for rid,room in eligible.items():
+            if rid in self.pending or rid in self.draining_probes: continue
+            state=self.states[rid]
+            if self._adaptive_room(room) and (now<self.douyin_blocked_until or self.douyin_recovery_rid or not self._platform_slot_available(settings)): continue
+            if now<self.due.get(rid,0): continue
+            rescue=self.recoveries.get(rid)
+            if rescue:
+                if now>=rescue['next_at'] and rescue['attempts']<2: return
+                continue
+            if not state.get('timeout_retry_remaining'):
+                if settings.get('status_only_mode',True):
+                    if now>=self._status_due_at(rid,settings): return
+                elif rid in self.round_queue or not self.round_active and now>=self._next_round_at(settings): return
+                continue
+            if now>=state.get('_timeout_fallback_at',float('inf')):
+                candidates.append((state.get('_last_attempt_monotonic',0),room['sort_order'],rid))
+        # An already-running other room owns a real opportunity and will drain
+        # or time out normally. Do not manufacture a fallback ahead of it.
+        if self.pending: return
+        if candidates:
+            rid=min(candidates)[2]
+            self.states[rid]['timeout_retry_remaining']=0
+            self.states[rid]['_timeout_eligible_at']=now
+            self.states[rid]['status_note']='检查超时，恢复中；暂无其他可检查房间，按正常检查间隔重试'
     def _expire_pending_checks(self,now):
         """Fence overdue results while their transport finishes shutting down.
 
         Only dispatched checks own a clock. An undispatched room can wait for
-        pacing or capacity indefinitely without being labelled a timeout. Keep
-        a timed-out future's slot until it returns so a stuck custom provider
-        cannot create overlapping requests or an unbounded retry thread pool.
+        pacing or capacity indefinitely without being labelled a timeout. Free
+        the logical slot immediately; quarantine the old request until it ends
+        so a stuck custom provider cannot cause duplicate requests for its room.
         """
         if self.stop_event.is_set(): return
         for rid,submitted in list(self.pending.items()):
-            future=submitted[0]; started=self._check_started(submitted)
+            future=submitted[0]; started=self._check_started(submitted); budget=self._check_budget(submitted)
             response_at=(getattr(future,'probe_timing',None) or {}).get('response_at')
-            if (started is None or now-started<=CHECK_TIMEOUT_SECONDS
-                    or response_at is not None and response_at-started<=CHECK_TIMEOUT_SECONDS
-                    or future in self.timed_out_probes or future in self.discarded_probes): continue
+            if (started is None or now-started<=budget
+                    or response_at is not None and response_at-started<=budget
+                    or future in self.timed_out_probes): continue
             try: room=self.store.get_room(rid)
-            except ValueError: continue
-            if not room['monitor_enabled'] or submitted[1]!=self._identity(room) or submitted[2]!=self.auth_generation: continue
+            except ValueError: room=None
+            accepted=bool(room and room['monitor_enabled'] and submitted[1]==self._identity(room)
+                          and submitted[2]==self.auth_generation and future not in self.discarded_probes)
             self.timed_out_probes.add(future)
             self.discarded_probes.add(future)
-            state=self._state(room)
-            state['last_check_finished_at']=now_iso()
-            state['last_probe_latency_seconds']=CHECK_TIMEOUT_SECONDS
-            state['source_refreshing']=False
-            self.status_last_finished[rid]=started+CHECK_TIMEOUT_SECONDS
+            self.pending.pop(rid)
+            self.draining_probes[rid]=future
             self.probe_failures+=1; self.probe_timeouts+=1
-            self._handle_probe_error(room,state,'检查超过 4 秒未完成，正在自动恢复。','network_error',0,'network=deadline stage=source_request')
-            state['status_note']='检查超过 4 秒未完成，正在自动恢复；保留上次确认的直播场次'
-            self._persist(rid,state)
+            if accepted:
+                state=self._state(room)
+                state['last_check_finished_at']=now_iso()
+                state['last_probe_latency_seconds']=round(budget,3)
+                state['source_refreshing']=False
+                self.status_last_finished[rid]=started+budget
+                timeout_text=f'{budget:.2f}'.rstrip('0').rstrip('.')
+                self._schedule_timeout_retry(room,state,f'检查超过 {timeout_text} 秒未完成，正在自动恢复。')
+                self._persist(rid,state)
+            elif self.douyin_recovery_rid==rid: self.douyin_recovery_rid=None
+            abort=getattr(self.pool,'abort',None)
+            if abort: abort(future)
+            else: future.cancel()
+            self._complete_round(now)
             self.wake.set()
+    def _schedule_timeout_retry(self,room,state,message,retry_after=0,diagnostic='network=deadline stage=source_request'):
+        rid=room['id']; now=time.monotonic(); settings=self.store.get_settings()
+        step=state.get('timeout_retry_step',0)%4
+        yields=(1,2,4,8)[step]
+        period=(settings.get('status_poll_interval_seconds',8) if settings.get('status_only_mode',True)
+                else settings.get('monitor_interval_minutes',.5)*60)
+        state.update(timeout_retry_step=(step+1)%4,timeout_retry_yield_count=yields,timeout_retry_remaining=yields,
+                     monitor_recovering=True,detection_uncertain=True,offline_checks=0,
+                     last_checked=now_iso(),live_status='error',last_error=message,error_code='network_error',
+                     error_diagnostic=sanitize_probe_diagnostic(diagnostic),failure_count=state.get('failure_count',0)+1,
+                     _timeout_fallback_at=now+period,_timeout_yield_waiting=True)
+        state.pop('_offline_recheck_at',None)
+        state.pop('_error_recheck_at',None)
+        state.pop('_timeout_eligible_at',None)
+        self.recoveries.pop(rid,None)
+        if self.douyin_recovery_rid==rid:
+            self.douyin_recovery_rid=None
+            self.douyin_recovery_successes=0
+        facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(diagnostic).split())
+        server_retry=max(int(facts.get('retry_after','0')),int(facts.get('page_retry_after','0')))
+        self.due[rid]=max(self.due.get(rid,0),now+server_retry)
+        state['status_note']=f'检查超时，恢复中；让出 {yields} 次检查机会后重试'
+        self.store.append_event('probe_timeout',room,state['status_note'])
+        if not settings.get('status_only_mode',True): self._enqueue_checks([rid])
+    def _finish_draining_probe(self,rid,future):
+        if self.draining_probes.get(rid) is not future: return False
+        self.draining_probes.pop(rid,None)
+        self.timed_out_probes.discard(future)
+        self.discarded_probes.discard(future)
+        self.wake.set()
+        return True
     def _finished(self,rid,future):
         with self.lock:
+            if self._finish_draining_probe(rid,future): return
             submitted=self.pending.get(rid)
             if submitted is None or submitted[0] is not future: return
             self._expire_pending_checks(time.monotonic())
+            if self._finish_draining_probe(rid,future): return
             self._expire_recoveries(time.monotonic())
             self.pending.pop(rid)
             timed_out=future in self.timed_out_probes
@@ -698,8 +799,10 @@ class Engine:
                         self.probe_timeouts+=1
                 else:
                     self.probe_successes+=1
-            except Exception:
-                if not timed_out: self.probe_failures+=1
+            except Exception as exc:
+                if not timed_out:
+                    self.probe_failures+=1
+                    if isinstance(exc,TimeoutError): self.probe_timeouts+=1
             try:
                 self._accept_finished(rid,future,submitted)
             finally:
@@ -720,7 +823,8 @@ class Engine:
             try: result=future.result()
             except Exception as exc:
                 code='network_error' if isinstance(exc,(OSError,TimeoutError)) else ''
-                self._handle_probe_error(room,state,'检查失败：'+safe_message(exc),code); return
+                diagnostic='network=timeout' if isinstance(exc,TimeoutError) else ''
+                self._handle_probe_error(room,state,'检查失败：'+safe_message(exc),code,diagnostic=diagnostic); return
             result_facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(getattr(result,'diagnostic','')).split())
             if result_facts.get('page_result')=='deferred': state['_status_page_requested']=True
             if (result_facts.get('stage')=='room_page' or result_facts.get('page_stage')=='room_page') and result_facts.get('page_result')!='cooldown':
@@ -743,6 +847,7 @@ class Engine:
             state['_last_success_monotonic']=time.monotonic()
             state['detection_uncertain']=False
             state['monitor_recovering']=False
+            self._clear_timeout_retry(state)
             state.pop('_error_recheck_at',None)
             self.due[rid]=0
             rescue=self.recoveries.pop(rid,None)
@@ -900,6 +1005,9 @@ class Engine:
         state['offline_checks']=0
         state.pop('_offline_recheck_at',None)
         facts=dict(token.split('=',1) for token in sanitize_probe_diagnostic(diagnostic).split())
+        if facts.get('network') in ('timeout','deadline') or facts.get('page_network') in ('timeout','deadline'):
+            self._schedule_timeout_retry(room,state,message,retry_after,diagnostic)
+            return
         empty_response=(error_code in ('anonymous_restricted','platform_unavailable') and
                         (facts.get('body') in ('empty','missing_room') or facts.get('platform_status')=='30003'))
         # An empty platform reply is ambiguous, but repeating it immediately
@@ -941,7 +1049,7 @@ class Engine:
                 # callback may be waiting for this lock; preserve that result
                 # instead of letting the scheduler's later clock discard it.
                 if (received is not None and started is not None
-                        and received<=rescue['deadline'] and received-started<=CHECK_TIMEOUT_SECONDS
+                        and received<=rescue['deadline'] and received-started<=self._check_budget(pending)
                         and pending[0] not in self.discarded_probes): continue
             self.recoveries.pop(rid,None)
             if pending: self.discarded_probes.add(pending[0])
@@ -966,7 +1074,7 @@ class Engine:
             if independent and time.monotonic()<self._next_dispatch_at(settings): break
             # Leave capacity for fresh rooms during a wave of transient errors.
             if independent and self.max_concurrent_checks>1 and any(key in self.recoveries for key in self.pending) and self._fresh_checks_waiting(eligible,settings,now): break
-            if rid not in eligible or rid in self.pending or now<rescue['next_at']: continue
+            if rid not in eligible or rid in self.pending or rid in self.draining_probes or now<rescue['next_at']: continue
             if rescue['attempts']>=2: continue
             room=eligible[rid]
             if self._adaptive_room(room):
@@ -975,7 +1083,7 @@ class Engine:
             submitted_at=time.monotonic()
             retry_settings=self._probe_settings(room,settings,min(rescue['deadline'],submitted_at+2.5))
             future=self.pool.submit(self.providers.check,dict(room),retry_settings)
-            self.pending[rid]=(future,self._identity(room),self.auth_generation,submitted_at)
+            self.pending[rid]=(future,self._identity(room),self.auth_generation,submitted_at,retry_settings['_probe_budget_seconds'])
             self._record_submission(room,submitted_at)
             self.last_probe_submitted_at=submitted_at
             self.last_dispatch_was_recovery=True
@@ -1265,16 +1373,18 @@ class Engine:
                     self.store.close_session(state.get('source_room',room),now_iso(),reason='configuration_changed')
                     state.update(source_identity=identity,source_room=dict(room),resolved_stream_url='',stream_variants=[],resolved_room_input='',record_headers={},confirmed_live=None,live_status='checking',live_started_at='',observed_started_at='',started_at_source='',live_session_id='',avatar_url='',live_ended_at='',platform_ended_at='',offline_checks=0,status_note='',last_error='',error_code='',error_diagnostic='',failure_count=0,retry_at=0,duration_seconds=0,record_path='',record_status='idle')
                     state.update(last_success_at='',last_attempt_at='',last_probe_latency_seconds=None,_last_success_monotonic=None)
-                    state.update(detection_uncertain=True,last_check_finished_at='',last_actual_check_interval_seconds=None,monitor_recovering=False,check_started_at='')
+                    state.update(detection_uncertain=True,last_check_finished_at='',last_actual_check_interval_seconds=None,monitor_recovering=False,check_started_at='',timeout_retry_step=0,timeout_retry_yield_count=0,timeout_retry_remaining=0)
                     state['last_ended_session_id']=''
-                    for key in ('_offline_recheck_at','_error_recheck_at','_last_attempt_monotonic','_status_page_not_before'): state.pop(key,None)
+                    for key in ('_offline_recheck_at','_error_recheck_at','_timeout_fallback_at','_timeout_eligible_at','_timeout_yield_waiting','_last_attempt_monotonic','_status_page_not_before'): state.pop(key,None)
                     self.due[room['id']]=0
                     self._persist(room['id'],state)
                 if not room['monitor_enabled']:
                     self._cancel_recovery(room['id'])
                     if room['id'] in self.pending: self.discarded_probes.add(self.pending[room['id']][0])
                     if room['id'] in self.metadata_pending: self.discarded_metadata.add(self.metadata_pending[room['id']][0])
-                    state.update(live_status='disabled',monitor_recovering=False); self._stop_record(room['id'],room)
+                    state.update(live_status='disabled',monitor_recovering=False)
+                    self._clear_timeout_retry(state)
+                    self._stop_record(room['id'],room)
                 elif state['live_status']=='disabled': state['live_status']='checking'
                 if not room['record_enabled']: self._stop_record(room['id'],room)
                 elif room['monitor_enabled'] and state['confirmed_live'] is True and state['resolved_stream_url']:
@@ -1365,7 +1475,8 @@ class Engine:
                 item['status_age_seconds']=None if age is None else round(age,2)
                 # One fixed delay plus the request budget is a normal cycle;
                 # freshness must not flicker expired while the next request runs.
-                freshness_budget=status_interval+self._probe_timeout(settings,room)
+                pending=self.pending.get(room['id'])
+                freshness_budget=status_interval+(self._check_budget(pending) if pending else self._probe_timeout(settings,room))
                 item['status_stale']=bool(room['monitor_enabled'] and (age is None or age>freshness_budget or state.get('detection_uncertain') or room['id'] in self.recoveries))
                 item['last_confirmed_status']='live' if state['confirmed_live'] is True else 'waiting' if state['confirmed_live'] is False else 'unknown'
                 item['room_status']=item['last_confirmed_status'] if room['monitor_enabled'] else 'disabled'
@@ -1397,7 +1508,7 @@ class Engine:
                 if pending and getattr(pending[0],'probe_timing',None) is not None:
                     item['check_started_at']=pending[0].probe_timing['started_iso']
                 item['check_state']='recovering' if item['monitor_recovering'] else 'checking' if item['checking'] else 'idle'
-                item['check_timeout_seconds']=CHECK_TIMEOUT_SECONDS
+                item['check_timeout_seconds']=self._check_budget(pending) if pending else self._probe_timeout(settings,room)
                 earliest=(self._status_due_at(room['id'],settings) if status_mode else
                           max(self.due.get(room['id'],0),next_room,0 if self.round_active else next_round))
                 if self._adaptive_room(room): earliest=max(earliest,self.douyin_blocked_until)

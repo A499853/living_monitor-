@@ -30,6 +30,7 @@ class QueuePool:
     def __init__(self): self.calls=[]; self.rebuilds=0
     def submit(self,function,room,settings):
         future=concurrent.futures.Future()
+        future.set_running_or_notify_cancel()
         self.calls.append((room,settings,future))
         return future
     def shutdown(self,**kwargs): pass

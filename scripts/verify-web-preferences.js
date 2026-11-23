@@ -2,6 +2,10 @@
 // Offline checks for source choice and recording UI requests; no live service.
 const assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),vm=require("node:vm");
 const source=fs.readFileSync(path.join(__dirname,"../app/livewatch/web/app.js"),"utf8");
+const html=fs.readFileSync(path.join(__dirname,"../app/livewatch/web/index.html"),"utf8");
+const timeoutInput=html.match(/<input\b[^>]*\bid="statusRequestTimeout"[^>]*>/)?.[0];assert.ok(timeoutInput);
+assert.match(timeoutInput,/min="2"/);assert.match(timeoutInput,/max="60"/);assert.match(timeoutInput,/value="4"/);
+assert.ok(html.includes("最多同时检查的房间数")&&html.includes("所有房间每秒最多启动检查数"));
 function section(start,end){return source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));}
 const calls=[],nodes=new Map(),rooms=[{id:"live",nickname:"直播中",live_status:"live",last_confirmed_status:"live",record_enabled:false},{id:"waiting",live_status:"waiting",last_confirmed_status:"waiting",record_enabled:false}];
 function node(id){if(!nodes.has(id))nodes.set(id,{id,value:"",textContent:"",style:{},options:[],disabled:false,open:false,listeners:{},addEventListener(name,callback){this.listeners[name]=callback;},videoWidth:0,videoHeight:0,replaceChildren(){this.options=[];},append(child){this.options.push(child);},showModal(){this.open=true;},close(){this.open=false;this.listeners.close?.();}});return nodes.get(id);}
@@ -36,5 +40,9 @@ context.window.innerWidth=375;context.window.innerHeight=667;context.fitPlayer()
  node("recordDirectory").value="keep";directoryCallback({data:{event:"recording-directory-selected",request_id:"recordDirectory",path:"",cancelled:true}});assert.equal(node("recordDirectory").value,"keep");
  directoryCallback({data:{event:"recording-directory-selected",request_id:"recordDirectory",path:"F:\\Video",cancelled:false}});assert.equal(node("recordDirectory").value,"F:\\Video");
  node("roomInput").value="room-identity";directoryCallback({data:{event:"recording-directory-selected",request_id:"roomInput",path:"wrong-target",cancelled:false}});assert.equal(node("roomInput").value,"room-identity","directory callback cannot write unrelated inputs");
- console.log("PASS: source defaults, quality fallback, adaptive player, configure-before-record, live-room bulk selection, cancellation, and directory callback isolation");
+ context.updateMonitorStrategyHint=()=>{};context.updateAccessModeHint=()=>{};context.updateDiskStatus=()=>{};
+ vm.runInContext(section("function settings()","async function bulk("),context);
+ rooms[0].monitor_enabled=false;const beforeRooms=JSON.stringify(rooms);
+ for(const seconds of [20,60]){calls.length=0;context.settings();node("statusRequestTimeout").value=String(seconds);await node("settingsForm").onsubmit({preventDefault(){},submitter:{disabled:false}});assert.equal(calls.length,1);assert.equal(calls[0][0],"/api/settings");assert.equal(calls[0][1],"PUT");assert.equal(calls[0][2].status_request_timeout,seconds,"custom timeout must survive form submission");assert.equal(JSON.stringify(rooms),beforeRooms,"saving settings cannot enable disabled rooms");}
+ console.log("PASS: source defaults, quality fallback, adaptive player, recording requests, cancellation, directory isolation, 20/60-second settings, and disabled-room preservation");
 })().catch(error=>{console.error(error);process.exitCode=1;});

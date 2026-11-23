@@ -249,6 +249,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not 0 <= args.duration <= 7 * 86400:
         parser.error("duration must be between 0 and 604800 seconds")
-    if not 2 <= args.request_timeout <= 15:
-        parser.error("request-timeout must be between 2 and 15 seconds")
+    if not 2 <= args.request_timeout <= 60:
+        parser.error("request-timeout must be between 2 and 60 seconds")
     run(args.duration, args.report, args.request_timeout)

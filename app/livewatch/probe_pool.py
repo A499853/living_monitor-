@@ -185,9 +185,27 @@ class ProbePool:
             if self._closed.is_set():
                 raise RuntimeError('cannot schedule new futures after shutdown')
             timing={'started_at':None,'started_iso':'','response_at':None}
-            future=self._executor.submit(self._run, function, dict(room), dict(settings),timing)
+            job={'cancelled':threading.Event(),'worker':None}
+            future=self._executor.submit(self._run, function, dict(room), dict(settings),timing,job)
             future.probe_timing=timing
+            future.probe_job=job
             return future
+
+    def abort(self,future):
+        """Stop one timed-out process without blocking the coordinator lock."""
+        with self._available:
+            job=getattr(future,'probe_job',None)
+            if job is None: return False
+            job['cancelled'].set()
+            worker=job['worker']
+            if worker in self._workers:
+                self._start_retirement_locked({worker})
+            self._available.notify_all()
+        # Queued executor work can disappear immediately. A running thread
+        # keeps its bounded executor slot until it returns; the engine fences
+        # its room against re-entry separately from the logical check queue.
+        future.cancel()
+        return True
 
     def _acquire_worker(self, deadline):
         while True:
@@ -245,13 +263,14 @@ class ProbePool:
         # Re-evaluate it without sending a request through an excess child.
         return self._acquire_worker(deadline)
 
-    def _run(self, function, room, settings,timing=None):
+    def _run(self, function, room, settings,timing=None,job=None):
+        cancelled=job['cancelled'] if job else threading.Event()
         if self._closed.is_set():
             return _failure(stopped=True)
         with self._lock:
             isolated = self._isolation_enabled and settings.get('monitor_process_isolation', True)
         budget=settings.get('_probe_budget_seconds')
-        budget=budget if type(budget) in (int,float) and math.isfinite(budget) and 0<budget<=4 else None
+        budget=budget if type(budget) in (int,float) and math.isfinite(budget) and 0<budget<=60 else None
         def started():
             at=time.monotonic()
             if timing is not None: timing.update(started_at=at,started_iso=datetime.now().astimezone().isoformat(timespec='seconds'))
@@ -261,6 +280,7 @@ class ProbePool:
             if timing is not None: timing['response_at']=time.monotonic()
             return result
         if not isolated:
+            if cancelled.is_set(): return _failure(stopped=True)
             started()
             return completed(function(room, settings))
         deadline = settings.get('_probe_deadline')
@@ -277,7 +297,7 @@ class ProbePool:
             if budget is not None:
                 # Queue/process-capacity waiting is not a platform check. Give
                 # its network operation a fresh bounded budget once leased.
-                while not self._closed.is_set():
+                while not self._closed.is_set() and not cancelled.is_set():
                     try:
                         worker=self._acquire_worker(time.monotonic()+1)
                         break
@@ -285,9 +305,14 @@ class ProbePool:
             else:
                 worker = self._acquire_worker(deadline)
             if worker is None:
-                if self._closed.is_set(): return _failure(stopped=True)
+                if self._closed.is_set() or cancelled.is_set(): return _failure(stopped=True)
                 started()
                 return completed(function(room, settings))
+            with self._available:
+                if job is not None: job['worker']=worker
+                if cancelled.is_set():
+                    self._start_retirement_locked({worker})
+                    return _failure(stopped=True)
             actual_deadline=started()
             if budget is not None: deadline=actual_deadline
             if time.monotonic() >= deadline:
@@ -303,6 +328,7 @@ class ProbePool:
             return _failure(deadline=timed_out, stopped=self._closed.is_set())
         finally:
             with self._available:
+                if job is not None: job['worker']=None
                 self._busy_workers.discard(worker)
                 retire = worker in self._workers and (
                     not self._isolation_enabled or self._closed.is_set()

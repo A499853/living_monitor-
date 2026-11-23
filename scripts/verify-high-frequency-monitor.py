@@ -125,11 +125,14 @@ class HighFrequencyChecks(unittest.TestCase):
                     self.assertEqual(len(provider.starts),150)
                     self.assertTrue(all(len(starts)>=2 for starts in provider.starts.values()))
                     gaps=[starts[1]-starts[0] for starts in provider.starts.values()]
-                    starts=sorted(at for values in provider.starts.values() for at in values)
                 self.assertGreaterEqual(min(gaps),8.0)
                 self.assertLess(max(gaps),10.0)
-                # The budget covers the first wave and subsequent room cycles.
-                self.assertLessEqual(max(sum(at<=other<at+.99 for other in starts) for at in starts),20)
+                # This setting limits dispatches, including both waves. Worker
+                # thread entry can be delayed by the OS across a second boundary
+                # and is not the instant when the scheduler reserves its slot.
+                with engine.lock: dispatches=list(engine.probe_started_times)
+                self.assertGreaterEqual(len(dispatches),300)
+                self.assertLessEqual(max(sum(at<=other<at+1 for other in dispatches) for at in dispatches),20)
             finally:
                 if engine is not None:
                     engine.close()
@@ -433,7 +436,7 @@ class IndependentStatusChecks(unittest.TestCase):
         self.engine._tick()
         refresh=self.provider.wait_call('one',2)
         self.assertFalse(refresh['settings']['_status_only'])
-        self.assertEqual(refresh['settings']['_probe_deadline']-self.clock.now,4)
+        self.assertEqual(refresh['settings']['_probe_deadline']-self.clock.now,self.store.get_settings()['request_timeout'])
         self.engine.request_sources(self.rooms['one']['id'])
         self.finish('one',ProbeResult(True,stream_url='https://media.invalid/stream.m3u8'),number=2)
         self.assertFalse(self.engine.snapshot()['rooms'][0]['source_refresh_pending'])

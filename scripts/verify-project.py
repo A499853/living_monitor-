@@ -182,9 +182,13 @@ class RestorationChecks(unittest.TestCase):
                         {"monitor_process_isolation": 1}, {"monitor_schedule_mode": "invalid"},
                         {"status_check_concurrency": 65}, {"status_douyin_concurrency": True},
                         {"status_douyin_concurrency": 0}, {"status_only_mode": 1},
-                        {"status_poll_interval_seconds": 0}, {"status_request_timeout": 5},
-                        {"status_request_timeout": 16}):
+                        {"status_poll_interval_seconds": 0}, {"status_request_timeout": 61},
+                        {"status_request_timeout": True}):
             self.assertEqual(backend.request("PUT", "/api/settings", invalid)[0], 400)
+        for timeout in (20,60):
+            backend.json("PUT", "/api/settings", {"status_request_timeout":timeout})
+            self.assertEqual(backend.json("GET", "/api/state")["settings"]["status_request_timeout"],timeout)
+        backend.json("PUT", "/api/settings", {"status_request_timeout":settings["status_request_timeout"]})
         room = {"platform": "douyin", "room_input": "restore_smoke_20261121",
                 "nickname": "离线恢复测试", "monitor_enabled": False,
                 "record_enabled": False, "remark": "created"}

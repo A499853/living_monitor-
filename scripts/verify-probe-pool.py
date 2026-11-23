@@ -142,6 +142,43 @@ class ProbePoolChecks(unittest.TestCase):
         self.assertIs(future.result(timeout=3).live,False)
         self.assertIsNotNone(future.probe_timing['started_at'])
 
+    def test_long_relative_budgets_replace_stale_queued_deadline(self):
+        for budget in (20,60):
+            with self.subTest(budget=budget):
+                future=self.submit(seconds=-1,_probe_budget_seconds=budget)
+                self.assertIs(future.result(timeout=5).live,False)
+                self.assertIsNotNone(future.probe_timing['started_at'])
+
+    def test_abort_busy_process_is_nonblocking_and_reaps_before_replacement(self):
+        self.assertIs(self.submit().result(timeout=5).live,False)
+        worker=self.workers()[0]
+        self.server.slow_entered.clear(); self.server.release_slow.clear()
+        slow=dict(self.room,status_url=self.room['status_url'].replace('/status','/slow'))
+        future=self.submit(seconds=30,room=slow,_probe_budget_seconds=30)
+        self.assertTrue(self.server.slow_entered.wait(2))
+        with worker._close_lock:
+            began=time.monotonic()
+            self.assertTrue(self.pool.abort(future))
+            self.assertLess(time.monotonic()-began,.2)
+            self.assertIn(worker,self.pool._retiring_workers)
+        self.assertIsNone(future.result(timeout=3).live)
+        self.assertIsNotNone(worker.process.poll())
+        self.assertFalse(worker._io_thread.is_alive())
+        self.assertIs(self.submit().result(timeout=5).live,False)
+        self.assertNotEqual(self.workers()[0].process.pid,worker.process.pid)
+        self.server.release_slow.set()
+
+    def test_abort_queued_task_never_calls_provider(self):
+        entered=threading.Event(); release=threading.Event(); called=threading.Event()
+        self.addCleanup(release.set)
+        blocker=self.pool._executor.submit(lambda:(entered.set(),release.wait(3)))
+        self.assertTrue(entered.wait(1))
+        future=self.pool.submit(lambda *_:called.set(),self.room,{'monitor_process_isolation':False})
+        self.pool.abort(future)
+        release.set(); blocker.result(timeout=2)
+        self.assertTrue(future.cancelled())
+        self.assertFalse(called.is_set())
+
     def test_slow_loopback_endpoint_respects_total_deadline(self):
         # Measure the network deadline independently of cold process startup,
         # which can consume the short budget under parallel suite load.

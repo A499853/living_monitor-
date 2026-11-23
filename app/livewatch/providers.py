@@ -40,7 +40,9 @@ def _remaining_probe_time():
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise _ProbeDeadlineExceeded()
-    return min(TIMEOUT, remaining)
+    # A configured check deadline owns the full DNS/connect/read budget. The
+    # legacy eight-second socket default applies only without such a deadline.
+    return min(60, remaining)
 
 
 def _resolve_before_deadline(host, port):

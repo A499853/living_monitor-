@@ -87,6 +87,17 @@ class MediaPreferences(unittest.TestCase):
         with self.assertRaises(ValueError):
             maintenance.register_recording(destination/'test_000002.ts',process_id=os.getpid()+100,previous_segment=following)
 
+    def test_configured_timeout_survives_reopen_without_four_second_clamp(self):
+        for timeout in (20,60):
+            self.store.update_settings({'status_request_timeout':timeout,'request_timeout':timeout})
+            reopened=Store(self.root)
+            try:
+                self.assertEqual(reopened.get_settings()['status_request_timeout'],timeout)
+                self.assertEqual(reopened.get_settings()['request_timeout'],timeout)
+            finally: reopened.close()
+        for invalid in (1,61,True,float('nan')):
+            with self.assertRaises(ValueError): self.store.update_settings({'status_request_timeout':invalid})
+
     def test_custom_output_real_recording_and_conservative_retention(self):
         external = Path(self.temp.name)/'other volume 中文'
         external.mkdir()

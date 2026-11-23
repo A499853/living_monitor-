@@ -361,6 +361,31 @@ class ProviderStatusChecks(unittest.TestCase):
             server.server_close()
             thread.join(2)
 
+    def test_twenty_second_budget_accepts_real_response_after_eight_seconds(self):
+        class Delayed(BaseHTTPRequestHandler):
+            def log_message(self,*_args): pass
+            def do_GET(self):
+                time.sleep(9)
+                body=b'{"live":true}'
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Length',str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+                except OSError: pass
+        server=ThreadingHTTPServer(('127.0.0.1',0),Delayed)
+        server.daemon_threads=True
+        thread=threading.Thread(target=lambda:server.serve_forever(poll_interval=.02),daemon=True)
+        thread.start()
+        try:
+            began=time.monotonic()
+            result=self.provider.check(self.room|{'status_url':f'http://127.0.0.1:{server.server_port}/status'},
+                                       self.settings|{'_probe_deadline':began+20})
+            self.assertIs(result.live,True)
+            self.assertGreaterEqual(time.monotonic()-began,9)
+            self.assertLess(time.monotonic()-began,20)
+        finally:
+            server.shutdown(); server.server_close(); thread.join(2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
