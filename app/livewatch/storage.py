@@ -93,6 +93,10 @@ class Store:
         if room['input_type'] not in ('auto','room','account'): raise ValueError('输入类型必须为 auto、room 或 account')
         options=room['transfer_options']
         if not isinstance(options,dict) or len(json.dumps(options,ensure_ascii=False))>32768: raise ValueError('兼容配置内容无效或过长')
+        if 'wechat_bridge' in options:
+            if room['platform']!='wechat': raise ValueError('视频号桥接配置仅适用于微信视频号。')
+            from .wechat import validate_bridge
+            room['transfer_options']=dict(options,wechat_bridge=validate_bridge(options['wechat_bridge']))
         headers=room['request_headers']
         if not isinstance(headers,dict) or len(headers)>20: raise ValueError('请求头必须为对象，最多 20 项')
         for k,v in headers.items():

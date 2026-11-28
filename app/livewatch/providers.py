@@ -1084,6 +1084,10 @@ class ProviderRegistry:
                 raise ProbeError('不支持的平台。')
             if settings.get('_metadata_only'):
                 return self._session_metadata(room, settings)
+            options = room.get('transfer_options')
+            if platform == 'wechat' and isinstance(options, dict) and 'wechat_bridge' in options:
+                from .wechat import check_bridge
+                return check_bridge(room, settings)
             headers = validate_headers(room.get('request_headers') or {})
             if room.get('status_url'):
                 return self._status(room, headers, status_only=bool(settings.get('_status_only', False)))

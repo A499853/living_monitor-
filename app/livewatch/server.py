@@ -18,6 +18,7 @@ from .providers import _douyin_input, ProbeError
 from .playback import Playback
 from .media_options import recording_directory
 from .transfer import batch_payloads, decode_import, export_rooms
+from .wechat_capture import WechatCapture
 
 MAX_BODY = 128 * 1024
 MAX_IMPORT_BODY = 7 * 1024 * 1024 + 4096
@@ -47,10 +48,12 @@ class LocalServer(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         self.avatars = AvatarCache()
         self.playback = Playback(root)
+        self.wechat_capture = WechatCapture(root, store, engine)
         super().__init__(("127.0.0.1", port), Handler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
 
     def server_close(self):
+        self.wechat_capture.close()
         self.playback.close()
         super().server_close()
 
@@ -122,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 return self._reply(200, {"ok": True, "app": "LiveWatch", "version": __version__})
+            if path == '/api/wechat/capture':
+                return self._reply(200, self.server.wechat_capture.snapshot())
             if path.startswith('/api/playback/'):
                 parts = path.strip('/').split('/')
                 if len(parts) == 4 and parts[3] == 'status':
@@ -222,6 +227,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             limit = MAX_IMPORT_BODY if path == "/api/import" else MAX_BATCH_BODY if path == "/api/rooms/batch" else MAX_BODY
             body = self._body(limit)
+            if method == 'POST' and path.startswith('/api/wechat/capture/'):
+                capture = self.server.wechat_capture
+                if path == '/api/wechat/capture/start':
+                    return self._reply(200, capture.start(body.get('bridge_api', 'http://127.0.0.1:2022'),
+                        managed=body.get('managed') is True, consent=body.get('consent') is True))
+                if path == '/api/wechat/capture/stop':
+                    return self._reply(200, capture.stop())
+                if path == '/api/wechat/capture/stop-bridge':
+                    return self._reply(200, capture.stop_bridge())
+                if path == '/api/wechat/capture/add':
+                    return self._reply(200, capture.add(body.get('candidate_id')))
+                if path == '/api/wechat/capture/check':
+                    return self._reply(200, capture.check(body.get('bridge_api', 'http://127.0.0.1:2022')))
             if method == 'POST' and path.startswith('/api/room-source/') and path.endswith('/refresh'):
                 parts = path.strip('/').split('/')
                 if len(parts) != 4:

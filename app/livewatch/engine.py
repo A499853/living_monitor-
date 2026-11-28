@@ -658,7 +658,8 @@ class Engine:
         self.round_queue=ids+[rid for rid in self.round_queue if rid not in ids]
     @staticmethod
     def _identity(room):
-        return tuple(str(room.get(k,'')) for k in ['platform','room_input','input_type','stream_url','status_url','request_headers'])
+        from .wechat import bridge_identity
+        return tuple(str(room.get(k,'')) for k in ['platform','room_input','input_type','stream_url','status_url','request_headers']) + bridge_identity(room)
     def _adaptive_room(self,room):
         return bool(getattr(self.providers,'adaptive_polling',False) and room['platform']=='douyin' and not room.get('status_url') and not room.get('stream_url'))
     @staticmethod
@@ -963,6 +964,8 @@ class Engine:
                     state['platform_ended_at']=''
                     state['last_ended_session_id']=session['id'] if session else ''
                     self.store.close_session(room,at)
+                    if ended and room.get('platform')=='wechat' and session:
+                        self.store.update_session_end(room,session['id'],platform_id,ended,'wechat.joinLive.endTime')
                     self.store.append_event('live_ended',room,'监测到下播（本机检测时间）')
                 elif initial_offline:
                     session_id=self.store.discover_ended_session(room,platform_id,actual,ended,at)

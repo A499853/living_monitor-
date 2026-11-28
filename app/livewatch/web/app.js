@@ -123,7 +123,7 @@ function renderEvents(){const signature=JSON.stringify(S.events);if(S.eventSigna
 function notifyEvents(){for(const e of S.events){const key=String(e.id??[e.room_id,e.kind,e.created_at].join("|"));if(!S.seen.has(key)&&S.initialized&&e.kind==="live_started"){toast((e.nickname||"直播间")+" 已开播","success",7000);if(!S.nativeSound&&S.settings.sound_enabled&&S.audioReady)playSound();}S.seen.add(key);}if(S.seen.size>10000)S.seen=new Set([...S.seen].slice(-3000));}
 async function refresh(){if(S.polling||S.stopped)return;S.polling=true;try{const d=await api("/api/state");S.rooms=Array.isArray(d.rooms)?d.rooms:[];S.settings=d.settings||{};S.monitor=d.monitor||{};S.maintenance=d.maintenance||{};S.events=Array.isArray(d.events)?d.events:[];S.nativeSound=Boolean(d.native_sound_available);S.auth=d.auth||{};updateAuth();updateMonitor();updateDiskStatus();const ids=new Set(S.rooms.map(r=>r.id));for(const id of S.selected)if(!ids.has(id))S.selected.delete(id);const stats=d.stats||{};$("totalStat").textContent=stats.total??S.rooms.length;$("liveStat").textContent=S.rooms.filter(r=>visibleStatus(r)==="live").length;$("monitorStat").textContent=stats.monitoring??S.rooms.filter(r=>r.monitor_enabled).length;$("recordStat").textContent=stats.recording??S.rooms.filter(r=>r.record_status==="recording").length;$("ffmpegNotice").classList.toggle("hidden",d.ffmpeg_available!==false);$("connection").textContent="● 本地服务运行中";$("connection").classList.remove("offline");$("updatedLabel").textContent="页面更新于 "+new Date().toLocaleTimeString("zh-CN",{hour12:false});renderRooms();renderEvents();notifyEvents();S.initialized=true;}catch(e){$("connection").textContent="● 本地服务未连接";$("connection").classList.add("offline");$("intervalLabel").textContent="连接中断";$("autoLabel").textContent="连接中断，等待恢复";$("updatedLabel").textContent=e.message;}finally{S.polling=false;}}
 function error(id,msg){$(id).textContent=msg;$(id).classList.toggle("hidden",!msg);}
-function platformHint(){const w=$("roomPlatform").value==="wechat";$("roomInput").placeholder=w?"视频号标识（需配置直播源或状态接口）":"直接粘贴手机分享的整段主页或直播文案，也支持 v.douyin.com 短链、完整链接和直播间 ID";$("platformHint").textContent=w?"只填视频号 ID 或分享链接无法查询；请在下方配置有效直播源或状态接口。":"可保留分享文案与换行，无需手动提取链接。主页分享按账号主页解析；裸 ID 默认按直播间查询，查抖音账号请选择“抖音账号”或加 @。";$("roomInputType").disabled=w;$("roomShareAuthHint").classList.toggle("hidden",w);if(w)$("sourceDetails").open=true;}
+function platformHint(){const w=$("roomPlatform").value==="wechat";$("roomInput").placeholder=w?"视频号标识（可先从首页捕获直播）":"直接粘贴手机分享的整段主页或直播文案，也支持 v.douyin.com 短链、完整链接和直播间 ID";$("platformHint").textContent=w?"只填视频号 ID 或分享链接无法查询。可从首页“捕获视频号直播”加入本场监控，或在下方配置状态接口；已捕获房间保留其桥接配置。":"可保留分享文案与换行，无需手动提取链接。主页分享按账号主页解析；裸 ID 默认按直播间查询，查抖音账号请选择“抖音账号”或加 @。";$("roomInputType").disabled=w;$("roomShareAuthHint").classList.toggle("hidden",w);if(w)$("sourceDetails").open=true;}
 async function openRoom(id="",source=false){if(S.loadingRoom)return;S.loadingRoom=true;try{let r=id?S.rooms.find(r=>r.id===id):{};if(id){const result=await api("/api/room-source/"+encodeURIComponent(id));r={...r,...(result.room||result)};}$("roomForm").reset();$("roomId").value=id;$("roomPlatform").value=r.platform||"douyin";$("roomInput").value=r.room_input||"";$("roomInputType").value=r.input_type||"auto";$("roomNickname").value=r.nickname||"";$("roomRemark").value=r.remark||"";$("roomMonitor").checked=r.monitor_enabled??true;$("roomRecord").checked=Boolean(r.record_enabled);fillRecordingQuality($("roomRecordQuality"),r.record_quality||"");$("roomRecordProtocol").value=r.record_protocol||"";$("roomRecordDirectory").value=r.record_directory||"";$("roomRecordDirectory").placeholder=S.settings.recording_directory||"留空使用软件目录下的 video 文件夹";$("roomRecordingOptions").classList.toggle("hidden",!r.record_enabled);$("roomStream").value=r.stream_url||"";$("roomStatusUrl").value=r.status_url||"";$("roomHeaders").value=r.request_headers&&Object.keys(r.request_headers).length?JSON.stringify(r.request_headers,null,2):"";$("resolvedUrl").value=r.resolved_stream_url||"";$("resolvedSource").classList.toggle("hidden",!r.resolved_stream_url);$("sourceDetails").open=source||Boolean(r.stream_url||r.status_url);$("roomTitle").textContent=id?(source?"直播源与直播间设置":"编辑直播间"):"添加直播间";$("saveRoomBtn").textContent=id?"保存更改":"添加直播间";error("roomError","");platformHint();$("roomDialog").showModal();$(source?"roomStream":"roomInput").focus();}catch(e){toast(e.message,"error");}finally{S.loadingRoom=false;}}
 $("roomForm").onsubmit=async e=>{e.preventDefault();error("roomError","");let headers={};try{if($("roomHeaders").value.trim())headers=JSON.parse($("roomHeaders").value);if(!headers||Array.isArray(headers)||typeof headers!=="object"||Object.values(headers).some(v=>typeof v!=="string"))throw new Error();}catch{error("roomError","请求头必须是 JSON 对象，且所有值为字符串。");return;}const id=$("roomId").value,data={platform:$("roomPlatform").value,room_input:$("roomInput").value.trim(),input_type:$("roomInputType").value,nickname:$("roomNickname").value.trim(),remark:$("roomRemark").value.trim(),monitor_enabled:$("roomMonitor").checked,record_enabled:$("roomRecord").checked,record_quality:$("roomRecordQuality").value,record_protocol:$("roomRecordProtocol").value,record_directory:$("roomRecordDirectory").value.trim(),stream_url:$("roomStream").value.trim(),status_url:$("roomStatusUrl").value.trim(),request_headers:headers};if(!data.room_input){error("roomError","请粘贴手机分享文案、主页 / 直播链接或填写标识。");return;}$("saveRoomBtn").disabled=true;try{await api(id?"/api/rooms/"+encodeURIComponent(id):"/api/rooms",id?"PUT":"POST",data);$("roomDialog").close();toast(id?"直播间设置已保存":"直播间已添加，正在准备检查");await refresh();}catch(ex){error("roomError",ex.message);}finally{$("saveRoomBtn").disabled=false;}};
 function confirmAction(title,message,ok){return new Promise(resolve=>{const d=$("confirmDialog");$("confirmTitle").textContent=title;$("confirmMessage").textContent=message;$("confirmOk").textContent=ok||"确认";let done=false;function finish(v){if(done)return;done=true;d.removeEventListener("cancel",cancel);$("confirmOk").onclick=null;$("confirmCancel").onclick=null;d.close();resolve(v);}function cancel(e){e.preventDefault();finish(false);}d.addEventListener("cancel",cancel);$("confirmOk").onclick=()=>finish(true);$("confirmCancel").onclick=()=>finish(false);d.showModal();$("confirmCancel").focus();});}
@@ -157,6 +157,77 @@ for(const n of document.querySelectorAll("[data-folder]"))n.onclick=async()=>{tr
 $("logsNav").onclick=()=>$("logsPanel").scrollIntoView({behavior:"smooth",block:"start"});$("homeNav").onclick=()=>window.scrollTo({top:0,behavior:"smooth"});
 $("copySourceBtn").onclick=()=>copyText($("resolvedUrl").value);
 $("shutdownBtn").onclick=async()=>{if(!await confirmAction("退出直播守望","正在录制的直播将先完成文件保存，随后停止后台监控。\n确定退出软件？","结束录制并退出"))return;try{await api("/api/shutdown","POST",{});S.stopped=true;$("connection").textContent="● 本地服务已退出";$("connection").classList.add("offline");$("autoLabel").textContent="监控已停止";$("updatedLabel").textContent="正在结束录制并退出软件。";toast("正在保存录制并退出软件…","info",10000);}catch(e){toast(e.message,"error");}};
+const wechatCapture={timer:null,generation:0,reading:false,busy:false,running:false,candidatesKey:"",adding:new Set()};
+function updateWechatCaptureControls(){
+ $("wechatCaptureStart").disabled=wechatCapture.busy||wechatCapture.running;
+ $("wechatCaptureStop").disabled=wechatCapture.busy||!wechatCapture.running;
+ $("wechatBridgeApi").disabled=wechatCapture.busy||wechatCapture.running;
+ $("wechatBridgeCheck").disabled=wechatCapture.busy;
+}
+function renderWechatCapture(data){
+ wechatCapture.running=data.running===true;
+ setText($("wechatCaptureStatus"),wechatCapture.running?`接收服务运行中 · 127.0.0.1:${data.port||13949}`:"接收服务未启动");
+ $("wechatCaptureStatus").classList.toggle("running",wechatCapture.running);
+ $("wechatCaptureStatus").title=data.message||"";
+ if(data.bridge_api&&document.activeElement!==$("wechatBridgeApi"))$("wechatBridgeApi").value=data.bridge_api;
+ $("wechatScriptPath").value=data.script_path||"";
+ $("wechatScriptRow").classList.toggle("hidden",!data.script_path);
+ const candidates=Array.isArray(data.candidates)?data.candidates:[];
+ setText($("wechatCandidatesCount"),`${candidates.length} 个`);
+ const key=JSON.stringify(candidates);
+ if(key!==wechatCapture.candidatesKey){
+  wechatCapture.candidatesKey=key;const content=document.createDocumentFragment();
+  for(const candidate of candidates){
+   if(typeof candidate.id!=="string")continue;
+   const row=el("div","wechat-candidate"),details=el("div","wechat-candidate-info");
+   details.append(el("strong","",candidate.nickname||"视频号直播"));
+   const identity=el("span","",candidate.username||"账号标识未提供");identity.title=candidate.username||"";details.append(identity);
+   const meta=el("small","",`场次 ${candidate.live_id||"—"} · 捕获于 ${dateTime(candidate.captured_at)}`);details.append(meta);
+   const button=el("button","button wechat-button","加入监控");button.type="button";button.disabled=wechatCapture.adding.has(candidate.id);
+   button.onclick=async()=>{
+    if(wechatCapture.adding.has(candidate.id))return;wechatCapture.adding.add(candidate.id);button.disabled=true;
+    try{const result=await api("/api/wechat/capture/add","POST",{candidate_id:candidate.id});toast(result.updated?"已更新该视频号的本场监控":"视频号已加入监控，可在列表中开启自动录制");await refresh();}
+    catch(e){error("wechatCaptureError",e.message);}
+    finally{wechatCapture.adding.delete(candidate.id);button.disabled=false;}
+   };
+   row.append(details,button);content.append(row);
+  }
+  if(!content.childElementCount)content.append(el("p","wechat-capture-empty",wechatCapture.running?"等待直播数据。请确认桥接工具已加载脚本，重新打开微信直播后点击“捕获到直播守望”。":"尚未捕获直播。启动接收后，按上方步骤连接微信。"));
+  $("wechatCandidates").replaceChildren(content);
+ }
+ updateWechatCaptureControls();
+}
+function scheduleWechatCaptureRead(){
+ clearTimeout(wechatCapture.timer);wechatCapture.timer=null;
+ if($("wechatCaptureDialog").open&&wechatCapture.running)wechatCapture.timer=setTimeout(readWechatCapture,2000);
+}
+async function readWechatCapture(){
+ if(wechatCapture.reading||wechatCapture.busy||!$("wechatCaptureDialog").open){scheduleWechatCaptureRead();return;}
+ wechatCapture.reading=true;const generation=wechatCapture.generation;
+ try{const data=await api("/api/wechat/capture");if(generation===wechatCapture.generation&&$("wechatCaptureDialog").open){renderWechatCapture(data);error("wechatCaptureError","");}}
+ catch(e){if(generation===wechatCapture.generation&&$("wechatCaptureDialog").open)error("wechatCaptureError",e.message);}
+ finally{wechatCapture.reading=false;scheduleWechatCaptureRead();}
+}
+$("wechatCaptureBtn").onclick=()=>{
+ if($("wechatCaptureDialog").open)return;
+ ++wechatCapture.generation;wechatCapture.candidatesKey="";error("wechatCaptureError","");$("wechatCaptureDialog").showModal();readWechatCapture();
+};
+$("wechatCaptureDialog").addEventListener("close",()=>{++wechatCapture.generation;clearTimeout(wechatCapture.timer);wechatCapture.timer=null;});
+async function changeWechatCapture(action){
+ if(wechatCapture.busy)return;wechatCapture.busy=true;++wechatCapture.generation;clearTimeout(wechatCapture.timer);updateWechatCaptureControls();error("wechatCaptureError","");
+ try{const data=await api("/api/wechat/capture/"+action,"POST",action==="start"?{bridge_api:$("wechatBridgeApi").value.trim()}:{});wechatCapture.candidatesKey="";renderWechatCapture(data);}
+ catch(e){error("wechatCaptureError",e.message);}
+ finally{wechatCapture.busy=false;updateWechatCaptureControls();readWechatCapture();}
+}
+$("wechatCaptureStart").onclick=()=>changeWechatCapture("start");
+$("wechatCaptureStop").onclick=()=>changeWechatCapture("stop");
+$("wechatBridgeCheck").onclick=async()=>{
+ if(wechatCapture.busy)return;wechatCapture.busy=true;updateWechatCaptureControls();setText($("wechatBridgeStatus"),"正在检查视频号页面连接…");
+ try{const result=await api("/api/wechat/capture/check","POST",{bridge_api:$("wechatBridgeApi").value.trim()});setText($("wechatBridgeStatus"),result.message||(result.available?"视频号页面已连接；打开目标直播后点击“捕获到直播守望”。":"桥接尚未连接视频号页面，请检查工具与微信窗口。"));}
+ catch(e){setText($("wechatBridgeStatus"),e.message);}
+ finally{wechatCapture.busy=false;updateWechatCaptureControls();scheduleWechatCaptureRead();}
+};
+$("wechatCopyScript").onclick=()=>{if($("wechatScriptPath").value)copyText($("wechatScriptPath").value);};
 async function quickAdd(){const input=$("quickRoomInput"),button=$("quickAddBtn"),value=input.value.trim();if(!value){input.focus();return;}button.disabled=true;try{const result=await api("/api/rooms/batch","POST",{text:value,platform:"douyin",input_type:$("quickInputType").value,monitor_enabled:true,record_enabled:false});if(Number(result.failed||0)===0)input.value="";showBatchResult(result,"批量添加结果");await refresh();}catch(e){toast(e.message,"error");}finally{button.disabled=false;}}
 $("quickAddBtn").onclick=quickAdd;$("quickRoomInput").addEventListener("keydown",e=>{if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)&&!e.isComposing){e.preventDefault();quickAdd();}});
 function showBatchResult(result,title){

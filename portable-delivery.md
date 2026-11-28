@@ -1,36 +1,29 @@
-# Windows 免安装交付
+# Windows 完整免安装交付
 
-将 ZIP **完整解压到有写入权限的文件夹**（例如 `D:\直播守望`），双击 `直播守望.exe`。请勿在压缩包预览窗口中直接运行。
+将 ZIP **完整解压到有写入权限的文件夹**（例如 `D:\直播守望`），双击 **直播守望.exe**。不要在压缩包预览中运行，也不要只复制 EXE。普通用户无需执行命令、安装 Python、pip 或浏览器。
 
-交付包已内置 `tools/ffmpeg.exe`，启动时直接使用，不再下载 FFmpeg。第一次启动显示依赖准备窗口，自动下载 Python 3.12.10、WebView2 固定版本运行库到 EXE 同目录的 `tools/`，下载总量约 307 MiB。准备后自动进入本地桌面窗口；后续启动复用这些文件，无需安装 Python、pip、浏览器或管理员安装。联网监控直播仍需网络。支持 Windows 10 22H2 / Windows 11 x64，自带的 .NET Framework 4.8 是启动器的系统前提。
+完整包包含 Python 3.12.10、固定版本 WebView2、FFmpeg 7.1、程序源码与界面、许可证；视频号版另外包含本机桥接工具 `tools/wechat-bridge/wx_video_download.exe`。正常完整解压后启动直接使用这些本地依赖，无需首次下载。直播监控本身仍需网络，视频号还需要电脑上已安装并登录的微信。
 
-首次准备建议至少预留 2 GB 磁盘空间，录像空间另计。可以取消下载；重新打开会保留已经安装的依赖，并在下载源支持时续传未完成文件。下载失败会重试，最终失败会说明原因，记录在 `logs/bootstrap.log`。如所在网络无法访问下载源，换可用网络后重新打开。不会将失败或校验不符的文件作为运行库使用。
+支持 Windows 10 22H2 / Windows 11 x64，使用系统 .NET Framework 4.8。请至少预留 2 GB 空间用于解压和启动，录像空间另计。请保留 EXE 旁的 `app/`、完整 `tools/`、两个依赖 JSON 和 WebView2 SDK 的三个 DLL；删除运行库文件后，应重新完整解压。旧启动器仍保留损坏依赖的联网修复能力，完整包的正常启动不会进入该流程。
 
-所有下载均使用发布包中固定的 HTTPS 地址、大小和 SHA-256 清单。解压在暂存目录完成，检查必需文件后才替换安装目录；启动会检查运行库收据的文件大小和缺失文件。压缩包路径不能越出暂存目录。下载请求有连接、读取和总耗时限制；WebView2 解压也有期限。运行库和下载文件不会写入系统目录或修改 PATH。
+## 视频号使用范围
 
-`app/`、`tools/ffmpeg.exe`、两个依赖 JSON、WebView2 SDK 的三个 DLL 必须随 EXE 保留，均已在 ZIP 中提供。用户数据、录像及设置默认也保存在 EXE 所在目录，搬迁软件时请整体移动文件夹。
+在主窗口点击“捕获视频号直播”，按软件提示连接本机桥接。电脑微信打开目标直播后，点击页面中的“捕获到直播守望”，再将候选加入监控。加入后复用状态检查、开关播记录、提示音和自动录制。
 
-## 开发者重新打包
+视频号首次捕获可能需要配置本机 HTTPS 捕获证书与系统代理；这是连接微信页面的配置，不是运行库下载。按首次配置提示完成后，监控期间保持桥接和视频号页面运行。当前接入支持已捕获场次的持续检查；下一场自动发现尚未验证，需要重新捕获。微信关闭、桥接断开或响应异常只记为无法确认，不据此误报下播。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1
-```
+## 交付内容与隐私
 
-输出为 `artifacts/LiveWatch-Optimized-Windows-x64.zip` 及 SHA-256 文件。包含启动器、程序源码、界面、`tools/ffmpeg.exe`、清单和许可证；不打包 Python、WebView2、下载缓存或任何用户数据。构建前必须准备项目的 `tools/ffmpeg.exe`，缺失或文件不完整时构建直接失败。压缩条目顺序和时间固定；C# 5 编译器本身不保证每次 EXE 字节一致，所以相同二进制输入可复现 ZIP，但重新编译可能改变 ZIP 哈希。
+- Python、WebView2 按固定文件白名单复制，打包前逐项核对大小与 SHA-256；不复制浏览器缓存或用户配置目录。
+- FFmpeg 和可选视频号桥接工具随包提供；桥接目录只包含发行程序、许可证与可选版本来源记录。
+- 每包包含 `package-manifest.json` 和 `runtime-source-manifest.json`。前者记录所有交付文件，后者列明固定运行库来源；ZIP 旁的 `.sha256` 是压缩包校验值。
+- 不包含直播间列表、账号登录、Cookie、录像、数据库、实测日志、本机生成的捕获脚本、证书及私钥。首次启动在当前软件目录创建自己的数据。
+- 搬迁已经使用的软件时需整体移动文件夹，用户设置、视频与开关播记录默认保存在软件目录内。
 
-仅准备依赖、不启动界面的诊断命令：
+## 打包与验收说明
 
-```powershell
-Start-Process -FilePath '.\直播守望.exe' -ArgumentList '--prepare-dependencies' -Wait
-```
+开发者使用 `scripts/build-portable.ps1` 生成完整离线包；`-RequireWechatBridge` 要求视频号桥接程序及许可证齐备，`-StageOnly` 只准备和验证目录，不生成 ZIP。普通用户不需要执行这些脚本。
 
-该模式将进度写入 `logs/bootstrap.log`，成功退出码为 0，失败为 1。常规用户直接双击 EXE 即可。
+构建会验证固定运行库白名单、生成与桌面启动器兼容的运行库收据，在实际待交付目录运行包内 Python 与 FFmpeg，并读取实际 EXE 的依赖就绪判断，要求不需要准备或下载依赖。最终 ZIP 还需由 `scripts/verify-delivery-package.py` 解压后重复校验。验证仅使用隔离目录，不访问真实平台或用户账号。
 
-## 启动链路验证（2026-11-22）
-
-- 25 项启动器回归断言通过，包括盘根和带空格目录、Windows 参数传递、相同数据目录共用实例锁、校验错误、缺失文件、篡改文件大小、损坏的安装收据、ZIP 路径越界、取消、安装失败保留原目录及成功替换；验证包内 FFmpeg 无需下载或安装收据即可复用，工作目录不同于 EXE 位置时仍在 EXE 同目录准备并复用依赖。
-- 早期未内置 FFmpeg 的启动链路测试在 `build/bootstrap-smoke/` 的空 `tools/` 目录实际联网下载三个依赖并完成 SHA-256 校验及解压。FFmpeg 下载到 86% 时强制结束测试进程，再启动后从 86% 继续，最终校验通过。当前交付包已内置 FFmpeg，不依赖该下载步骤。
-- 使用下载的 Python 成功导入 SSL、SQLite 等标准库，下载的 FFmpeg 正确报告 7.1。使用这些运行库启动实际桌面 EXE，健康接口返回 `LiveWatch 2.8.0`，宿主加载了本地 `WebView2Loader.dll` 和 `EmbeddedBrowserWebView.dll`。
-- 通过本地退出接口关闭隔离测试实例，窗口、后端和浏览器进程均退出，实例文件移除。第二次依赖准备退出码为 0，直接复用三个运行库，没有再次下载。
-
-最新桌面隔离验证记录在 `artifacts/portable-desktop-current-report.json`：使用固定运行库、系统 PATH 无 Python/浏览器，真实桌面窗口成功打开，数据和 WebView 模块位于 EXE 同目录；正常退出后隔离实例无残留进程。最新 ZIP 文件清单与哈希核验在 `artifacts/delivery-package-report.json`。历史真实下载记录在 `artifacts/portable-bootstrap-report.json`，原始下载进度在 `build/bootstrap-smoke/logs/bootstrap.log`。这验证了当前机器上的交付启动链路；没有代替不同 Windows 版本、代理网络和全天录制的实际验收。
+最新已执行结果以 `artifacts/delivery-stage-report.json`、`artifacts/delivery-package-report.json` 和实际直播验收记录为准。目录验证不代替最终 ZIP 验证；公开接口样例和模拟测试不代替真实微信直播验证。

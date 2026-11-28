@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$PackageName = 'LiveWatch-Optimized-Windows-x64',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$StageOnly,
+    [switch]$RequireWechatBridge
 )
 
 Set-StrictMode -Version Latest
@@ -25,10 +27,57 @@ foreach ($name in @($exeName, "$exeName.config", 'Microsoft.Web.WebView2.Core.dl
 foreach ($name in @('dependency-manifest.json', 'desktop-dependency-manifest.json')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $stage
 }
-# FFmpeg ships ready to run; only Python and WebView2 need first-launch downloads.
+# Ship clean fixed runtimes; never copy live browser profiles or entire tools/.
 $packagedTools = Join-Path $stage 'tools'
 New-Item -ItemType Directory -Path $packagedTools -Force | Out-Null
 Copy-Item -LiteralPath $ffmpegPath -Destination (Join-Path $packagedTools 'ffmpeg.exe')
+# The restoration inventory is an immutable allowlist for these fixed versions.
+# Hash every input before copying, so unknown additions and altered binaries do
+# not silently become release dependencies.
+$restored = Get-Content -LiteralPath (Join-Path $projectRoot 'restoration-manifest.json') -Raw | ConvertFrom-Json
+$runtimeInventory = @($restored.files | Where-Object { $_.path -match '^tools/(python|webview2)/' })
+if ($runtimeInventory.Count -eq 0) { throw 'The fixed runtime allowlist is missing.' }
+foreach ($item in $runtimeInventory) {
+    $relative = [string]$item.path
+    if ($relative -match '(^|/)\.\.(/|$)|[\\:]' -or [IO.Path]::IsPathRooted($relative)) { throw 'Unsafe runtime inventory path.' }
+    $source = [IO.Path]::GetFullPath((Join-Path $projectRoot $relative))
+    if (-not $source.StartsWith($projectRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Runtime source is outside the project.' }
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing fixed runtime file: $relative" }
+    $info = Get-Item -LiteralPath $source
+    if (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $info.Length -ne [long]$item.size -or
+        (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne [string]$item.sha256) {
+        throw "Fixed runtime differs from its verified inventory: $relative"
+    }
+    $destination = Join-Path $stage $relative
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $source -Destination $destination
+}
+$coreDependencies = Get-Content -LiteralPath (Join-Path $projectRoot 'dependency-manifest.json') -Raw | ConvertFrom-Json
+$desktopDependencies = Get-Content -LiteralPath (Join-Path $projectRoot 'desktop-dependency-manifest.json') -Raw | ConvertFrom-Json
+foreach ($runtimeName in @('python', 'webview2')) {
+    $runtimeRoot = Join-Path $packagedTools $runtimeName
+    $runtimeHash = if ($runtimeName -eq 'python') { $coreDependencies.python.sha256 } else { $desktopDependencies.webview2_runtime.sha256 }
+    [IO.File]::WriteAllText((Join-Path $runtimeRoot '.livewatch-package-sha256'), $runtimeHash, [Text.Encoding]::ASCII)
+    $receipt = [ordered]@{}
+    foreach ($file in Get-ChildItem -LiteralPath $runtimeRoot -Recurse -File -Force | Sort-Object FullName) {
+        $receipt[$file.FullName.Substring($runtimeRoot.Length + 1)] = $file.Length
+    }
+    [IO.File]::WriteAllText((Join-Path $runtimeRoot '.livewatch-runtime.json'), ($receipt | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+}
+[IO.File]::WriteAllText((Join-Path $stage 'runtime-source-manifest.json'), ($runtimeInventory | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+$bridgeRoot = Join-Path $projectRoot 'tools\wechat-bridge'
+$bridgeExecutable = Join-Path $bridgeRoot 'wx_video_download.exe'
+if (Test-Path -LiteralPath $bridgeExecutable -PathType Leaf) {
+    if (-not (Test-Path -LiteralPath (Join-Path $bridgeRoot 'LICENSE') -PathType Leaf)) { throw 'The bundled WeChat bridge requires its LICENSE.' }
+    $bridgeTarget = Join-Path $packagedTools 'wechat-bridge'
+    New-Item -ItemType Directory -Path $bridgeTarget -Force | Out-Null
+    foreach ($name in @('wx_video_download.exe', 'LICENSE', 'VERSION.txt', 'download-manifest.json')) {
+        $source = Join-Path $bridgeRoot $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $bridgeTarget $name) }
+    }
+} elseif ($RequireWechatBridge) {
+    throw 'The full WeChat delivery requires tools\wechat-bridge\wx_video_download.exe and LICENSE.'
+}
 foreach ($folder in @('app', 'licenses')) {
     $sourceRoot = Join-Path $projectRoot $folder
     foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -Recurse -File) {
@@ -59,10 +108,16 @@ for ($index = 0; $index -lt $documentNames.Count; $index++) {
     if ($index -eq 0) { $name += '.txt' } else { $name += '.md' }
     if (Test-Path -LiteralPath (Join-Path $projectRoot $name)) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $stage }
 }
-$inventory = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName | ForEach-Object {
+$inventory = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
     [ordered]@{ path = $_.FullName.Substring($stage.Length + 1).Replace('\','/'); size = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
 })
 [IO.File]::WriteAllText((Join-Path $stage 'package-manifest.json'), ($inventory | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+# Validate the actual staged files and embedded Python before producing a ZIP.
+$verificationArgs = @('-B', (Join-Path $PSScriptRoot 'verify-delivery-package.py'), '--stage', $stage)
+if ($RequireWechatBridge) { $verificationArgs += '--require-wechat-bridge' }
+& (Join-Path $stage 'tools\python\python.exe') @verificationArgs
+if ($LASTEXITCODE -ne 0) { throw 'Offline delivery validation failed.' }
+if ($StageOnly) { Write-Host "Staged offline package: $stage"; return }
 $artifactRoot = Join-Path $projectRoot 'artifacts'
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 $zipPath = Join-Path $artifactRoot ($PackageName + '.zip')
@@ -74,7 +129,7 @@ $stream = [IO.File]::Create($temporary)
 try {
     $zip = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create, $true)
     try {
-        foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName) {
+        foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force | Sort-Object FullName) {
             $relative = $file.FullName.Substring($stage.Length + 1).Replace('\','/')
             $entry = $zip.CreateEntry("$PackageName/$relative", [IO.Compression.CompressionLevel]::Optimal)
             $entry.LastWriteTime = [DateTimeOffset]::new(2000, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
