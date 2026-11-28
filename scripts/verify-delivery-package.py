@@ -23,6 +23,7 @@ BRIDGE_FILES = {'wx_video_download.exe', 'LICENSE', 'VERSION.txt', 'download-man
 REQUIRED = {'直播守望.exe', '直播守望.exe.config', 'app/run.py',
             'app/livewatch/engine.py', 'app/livewatch/web/app.js', 'app/livewatch/web/style.css',
             'app/livewatch/wechat.py', 'app/livewatch/wechat_capture.py', 'app/livewatch/wechat_capture.js',
+            'app/livewatch/wechat_runtime.py',
             'tools/ffmpeg.exe', 'tools/python/python.exe', 'tools/python/pythonw.exe',
             'tools/python/python312.dll', 'tools/python/python312.zip', 'tools/python/python312._pth',
             'tools/python/_ssl.pyd', 'tools/python/_sqlite3.pyd',
@@ -87,6 +88,9 @@ def verify_files(directory, require_wechat_bridge=False):
     # This exact vendor payload allowlist excludes all runtime side effects and
     # prevents an accidentally copied browser profile from entering the ZIP.
     restored = load_json(PROJECT/'restoration-manifest.json')
+    ffmpeg_source = next(item for item in restored['files'] if item['path'] == 'tools/ffmpeg.exe')
+    assert actual_hashes['tools/ffmpeg.exe'] == ffmpeg_source['sha256'], 'vendor FFmpeg changed'
+    assert files['tools/ffmpeg.exe'].stat().st_size == ffmpeg_source['size'], 'vendor FFmpeg size changed'
     expected_runtime = {item['path']: item for item in restored['files'] if item['path'].startswith(RUNTIME_PREFIXES)}
     runtime_source = load_json(directory/'runtime-source-manifest.json')
     assert isinstance(runtime_source, list) and len(runtime_source) == len(expected_runtime)
@@ -118,9 +122,20 @@ def verify_files(directory, require_wechat_bridge=False):
     bridge = {name for name in contents if name.startswith('tools/wechat-bridge/')}
     assert bridge <= {'tools/wechat-bridge/'+name for name in BRIDGE_FILES}, 'bridge contains machine-specific config or extra files'
     if require_wechat_bridge or bridge:
-        assert {'tools/wechat-bridge/wx_video_download.exe', 'tools/wechat-bridge/LICENSE'} <= bridge
+        assert {'tools/wechat-bridge/wx_video_download.exe', 'tools/wechat-bridge/LICENSE',
+                'tools/wechat-bridge/download-manifest.json'} <= bridge
         assert files['tools/wechat-bridge/wx_video_download.exe'].stat().st_size > 1000000
         assert files['tools/wechat-bridge/LICENSE'].stat().st_size > 0
+        bridge_source = load_json(files['tools/wechat-bridge/download-manifest.json'])
+        assert bridge_source['url'].startswith('https://github.com/ltaoo/wx_channels_download/releases/download/')
+        assert re.fullmatch('[a-f0-9]{64}', bridge_source['sha256']), 'invalid bridge archive hash'
+        assert bridge_source['publisher_checksum_verified'] is True, 'bridge release checksum was not verified'
+        bridge_inputs = bridge_source['files']
+        assert len(bridge_inputs) == 2 and {item['path'] for item in bridge_inputs} == {'wx_video_download.exe', 'LICENSE'}
+        for item in bridge_inputs:
+            name = 'tools/wechat-bridge/'+item['path']
+            assert actual_hashes[name] == item['sha256'], 'bridge release file changed: '+name
+            assert files[name].stat().st_size == item['size'], 'bridge release file size changed: '+name
     executable = files['直播守望.exe'].read_bytes()
     pe_offset = struct.unpack_from('<I', executable, 0x3c)[0]
     assert executable[:2] == b'MZ' and executable[pe_offset:pe_offset+4] == b'PE\0\0', 'invalid EXE'
@@ -148,7 +163,7 @@ def verify_files(directory, require_wechat_bridge=False):
                 vendor_runtime_files=len(expected_runtime), runtime_receipts_verified=True,
                 python_webview_download_on_first_launch=False, desktop_bootstrap_ready=True,
                 windows_gui_executable=True, embedded_python_version='2.8.0', embedded_ffmpeg_started=True,
-                wechat_bridge_bundled=bool(bridge))
+                wechat_bridge_bundled=bool(bridge), wechat_bridge_source_verified=bool(bridge))
 
 
 def verify(archive, require_wechat_bridge=False):

@@ -157,24 +157,35 @@ for(const n of document.querySelectorAll("[data-folder]"))n.onclick=async()=>{tr
 $("logsNav").onclick=()=>$("logsPanel").scrollIntoView({behavior:"smooth",block:"start"});$("homeNav").onclick=()=>window.scrollTo({top:0,behavior:"smooth"});
 $("copySourceBtn").onclick=()=>copyText($("resolvedUrl").value);
 $("shutdownBtn").onclick=async()=>{if(!await confirmAction("退出直播守望","正在录制的直播将先完成文件保存，随后停止后台监控。\n确定退出软件？","结束录制并退出"))return;try{await api("/api/shutdown","POST",{});S.stopped=true;$("connection").textContent="● 本地服务已退出";$("connection").classList.add("offline");$("autoLabel").textContent="监控已停止";$("updatedLabel").textContent="正在结束录制并退出软件。";toast("正在保存录制并退出软件…","info",10000);}catch(e){toast(e.message,"error");}};
-const wechatCapture={timer:null,generation:0,reading:false,busy:false,running:false,candidatesKey:"",adding:new Set()};
+const wechatCapture={timer:null,generation:0,reading:false,busy:false,running:false,runtimeRunning:false,recoveryPending:false,runtimeError:"",candidatesKey:"",adding:new Set()};
 function updateWechatCaptureControls(){
- $("wechatCaptureStart").disabled=wechatCapture.busy||wechatCapture.running;
+ $("wechatCaptureStart").disabled=wechatCapture.busy||(wechatCapture.running&&wechatCapture.runtimeRunning)||(!wechatCapture.runtimeRunning&&!$("wechatCaptureConsent").checked);
+ setText($("wechatCaptureStart"),wechatCapture.busy?"正在处理…":wechatCapture.runtimeRunning&&!wechatCapture.running?"继续接收直播":"启动内置捕获");
  $("wechatCaptureStop").disabled=wechatCapture.busy||!wechatCapture.running;
- $("wechatBridgeApi").disabled=wechatCapture.busy||wechatCapture.running;
+ $("wechatBridgeStop").disabled=wechatCapture.busy||(!wechatCapture.runtimeRunning&&!wechatCapture.recoveryPending&&!wechatCapture.runtimeError);
+ $("wechatCaptureManualStart").disabled=wechatCapture.busy||wechatCapture.running||wechatCapture.runtimeRunning;
+ $("wechatCaptureConsent").disabled=wechatCapture.busy||wechatCapture.runtimeRunning;
+ $("wechatCaptureConsentRow").classList.toggle("hidden",wechatCapture.runtimeRunning);
+ $("wechatBridgeApi").disabled=wechatCapture.busy||wechatCapture.running||wechatCapture.runtimeRunning;
  $("wechatBridgeCheck").disabled=wechatCapture.busy;
 }
 function renderWechatCapture(data){
  wechatCapture.running=data.running===true;
- setText($("wechatCaptureStatus"),wechatCapture.running?`接收服务运行中 · 127.0.0.1:${data.port||13949}`:"接收服务未启动");
+ const runtime=data.runtime||{};
+ wechatCapture.runtimeRunning=runtime.running===true;wechatCapture.recoveryPending=runtime.recovery_pending===true;
+ wechatCapture.runtimeError=data.runtime_error||runtime.last_error||"";
+ setText($("wechatCaptureStatus"),wechatCapture.running?"直播接收已开启 · 等待微信直播页面发送候选":"直播接收已停止");
  $("wechatCaptureStatus").classList.toggle("running",wechatCapture.running);
  $("wechatCaptureStatus").title=data.message||"";
+ setText($("wechatRuntimeStatus"),wechatCapture.runtimeRunning?"内置桥接运行中 · 已添加的直播持续监控":wechatCapture.recoveryPending?"仍有恢复事项 · 请点击“关闭桥接并恢复网络”":"内置桥接未运行");
+ $("wechatRuntimeStatus").classList.toggle("running",wechatCapture.runtimeRunning);
+ error("wechatRuntimeError",wechatCapture.runtimeError);
  if(data.bridge_api&&document.activeElement!==$("wechatBridgeApi"))$("wechatBridgeApi").value=data.bridge_api;
  $("wechatScriptPath").value=data.script_path||"";
  $("wechatScriptRow").classList.toggle("hidden",!data.script_path);
  const candidates=Array.isArray(data.candidates)?data.candidates:[];
  setText($("wechatCandidatesCount"),`${candidates.length} 个`);
- const key=JSON.stringify(candidates);
+ const key=JSON.stringify([candidates,wechatCapture.running,wechatCapture.runtimeRunning]);
  if(key!==wechatCapture.candidatesKey){
   wechatCapture.candidatesKey=key;const content=document.createDocumentFragment();
   for(const candidate of candidates){
@@ -192,19 +203,19 @@ function renderWechatCapture(data){
    };
    row.append(details,button);content.append(row);
   }
-  if(!content.childElementCount)content.append(el("p","wechat-capture-empty",wechatCapture.running?"等待直播数据。请确认桥接工具已加载脚本，重新打开微信直播后点击“捕获到直播守望”。":"尚未捕获直播。启动接收后，按上方步骤连接微信。"));
+  if(!content.childElementCount)content.append(el("p","wechat-capture-empty",wechatCapture.running?(wechatCapture.runtimeRunning?"等待直播数据。重新打开电脑微信中的目标直播，点击页面上的“捕获到直播守望”。":"等待外部桥接数据。请在高级手动接入中核对脚本和连接。"):"尚未捕获直播。启动内置捕获后，按上方步骤打开微信直播。"));
   $("wechatCandidates").replaceChildren(content);
  }
  updateWechatCaptureControls();
 }
 function scheduleWechatCaptureRead(){
  clearTimeout(wechatCapture.timer);wechatCapture.timer=null;
- if($("wechatCaptureDialog").open&&wechatCapture.running)wechatCapture.timer=setTimeout(readWechatCapture,2000);
+ if($("wechatCaptureDialog").open)wechatCapture.timer=setTimeout(readWechatCapture,2000);
 }
 async function readWechatCapture(){
  if(wechatCapture.reading||wechatCapture.busy||!$("wechatCaptureDialog").open){scheduleWechatCaptureRead();return;}
  wechatCapture.reading=true;const generation=wechatCapture.generation;
- try{const data=await api("/api/wechat/capture");if(generation===wechatCapture.generation&&$("wechatCaptureDialog").open){renderWechatCapture(data);error("wechatCaptureError","");}}
+ try{const data=await api("/api/wechat/capture");if(generation===wechatCapture.generation&&$("wechatCaptureDialog").open)renderWechatCapture(data);}
  catch(e){if(generation===wechatCapture.generation&&$("wechatCaptureDialog").open)error("wechatCaptureError",e.message);}
  finally{wechatCapture.reading=false;scheduleWechatCaptureRead();}
 }
@@ -213,14 +224,18 @@ $("wechatCaptureBtn").onclick=()=>{
  ++wechatCapture.generation;wechatCapture.candidatesKey="";error("wechatCaptureError","");$("wechatCaptureDialog").showModal();readWechatCapture();
 };
 $("wechatCaptureDialog").addEventListener("close",()=>{++wechatCapture.generation;clearTimeout(wechatCapture.timer);wechatCapture.timer=null;});
-async function changeWechatCapture(action){
+async function changeWechatCapture(action,managed=true){
+ if(action==="start"&&managed&&!wechatCapture.runtimeRunning&&!$("wechatCaptureConsent").checked){error("wechatCaptureError","请先勾选同意临时证书与系统代理配置，再启动内置捕获。");return;}
  if(wechatCapture.busy)return;wechatCapture.busy=true;++wechatCapture.generation;clearTimeout(wechatCapture.timer);updateWechatCaptureControls();error("wechatCaptureError","");
- try{const data=await api("/api/wechat/capture/"+action,"POST",action==="start"?{bridge_api:$("wechatBridgeApi").value.trim()}:{});wechatCapture.candidatesKey="";renderWechatCapture(data);}
+ try{const body=action==="start"?{bridge_api:managed?"http://127.0.0.1:2022":$("wechatBridgeApi").value.trim(),managed,consent:managed&&(wechatCapture.runtimeRunning||$("wechatCaptureConsent").checked)}:{};const data=await api("/api/wechat/capture/"+action,"POST",body);wechatCapture.candidatesKey="";renderWechatCapture(data);if(action==="stop-bridge"&&!wechatCapture.runtimeRunning&&!wechatCapture.recoveryPending)$("wechatCaptureConsent").checked=false;}
  catch(e){error("wechatCaptureError",e.message);}
  finally{wechatCapture.busy=false;updateWechatCaptureControls();readWechatCapture();}
 }
 $("wechatCaptureStart").onclick=()=>changeWechatCapture("start");
 $("wechatCaptureStop").onclick=()=>changeWechatCapture("stop");
+$("wechatBridgeStop").onclick=()=>changeWechatCapture("stop-bridge");
+$("wechatCaptureManualStart").onclick=()=>changeWechatCapture("start",false);
+$("wechatCaptureConsent").addEventListener("change",updateWechatCaptureControls);
 $("wechatBridgeCheck").onclick=async()=>{
  if(wechatCapture.busy)return;wechatCapture.busy=true;updateWechatCaptureControls();setText($("wechatBridgeStatus"),"正在检查视频号页面连接…");
  try{const result=await api("/api/wechat/capture/check","POST",{bridge_api:$("wechatBridgeApi").value.trim()});setText($("wechatBridgeStatus"),result.message||(result.available?"视频号页面已连接；打开目标直播后点击“捕获到直播守望”。":"桥接尚未连接视频号页面，请检查工具与微信窗口。"));}

@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,7 +21,98 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
-from livewatch.wechat_runtime import WechatRuntime, RuntimeErrorSafe, PROXY_VALUES, WindowsIntegration, guardian_main
+from livewatch.wechat_runtime import (WechatRuntime, RuntimeErrorSafe, CertificateConfirmationPending,
+                                      PROXY_VALUES, WindowsIntegration, guardian_main, certificate_removal_main)
+
+
+class CertificateApiChecks(unittest.TestCase):
+    fingerprint = '0123456789ABCDEF0123456789ABCDEF01234567'
+
+    def crypt(self, present=True, deleted=True):
+        class Function:
+            def __init__(self, implementation): self.implementation = implementation
+            def __call__(self, *args): return self.implementation(*args)
+        class Crypt: pass
+        api = Crypt()
+        api.events = []
+
+        def opened(provider, encoding, crypt_provider, flags, name):
+            self.assertEqual(provider.value, 13, 'must use physical registry store, not merged machine roots')
+            self.assertEqual(flags, 0x10000 | 0x4000)
+            self.assertEqual(name.value, 'ROOT')
+            api.events.append('open')
+            return 101
+
+        def find(store, encoding, flags, kind, pointer, previous):
+            self.assertEqual((store, encoding, flags, kind, previous), (101, 0x10001, 0, 0x10000, None))
+            blob = pointer._obj
+            self.assertEqual(bytes(blob.data[:blob.length]), bytes.fromhex(self.fingerprint))
+            api.events.append('find_exact')
+            ctypes.set_last_error(ctypes.c_long(0x80092004).value)
+            return 202 if present else None
+
+        def delete(context):
+            self.assertEqual(context, 202)
+            api.events.append('delete')
+            return deleted
+
+        api.CertOpenStore = Function(opened)
+        api.CertFindCertificateInStore = Function(find)
+        api.CertDeleteCertificateFromStore = Function(delete)
+        api.CertFreeCertificateContext = Function(lambda context: api.events.append('free'))
+        api.CertCloseStore = Function(lambda store, flags: api.events.append('close'))
+        return api
+
+    def test_helper_deletes_only_exact_current_user_certificate(self):
+        api = self.crypt()
+        with patch('livewatch.wechat_runtime.ctypes.WinDLL', return_value=api), \
+                patch.object(WindowsIntegration, '_run', side_effect=AssertionError('No certutil permitted')):
+            WindowsIntegration._certificate_action(self.fingerprint, remove=True)
+        self.assertEqual(api.events, ['open', 'find_exact', 'delete', 'close'])
+
+    def test_certificate_query_frees_context_without_deleting(self):
+        api = self.crypt()
+        with patch('livewatch.wechat_runtime.ctypes.WinDLL', return_value=api):
+            self.assertTrue(WindowsIntegration.certificate_present(self.fingerprint))
+        self.assertEqual(api.events, ['open', 'find_exact', 'free', 'close'])
+
+    def test_missing_certificate_does_not_delete_another(self):
+        api = self.crypt(present=False)
+        with patch('livewatch.wechat_runtime.ctypes.WinDLL', return_value=api):
+            self.assertFalse(WindowsIntegration.certificate_present(self.fingerprint))
+            WindowsIntegration._certificate_action(self.fingerprint, remove=True)
+        self.assertEqual(api.events, ['open', 'find_exact', 'close'] * 2)
+
+    def test_delete_failure_is_reported_without_double_free(self):
+        api = self.crypt(deleted=False)
+        with patch('livewatch.wechat_runtime.ctypes.WinDLL', return_value=api):
+            with self.assertRaisesRegex(RuntimeErrorSafe, '无法移除'):
+                WindowsIntegration._certificate_action(self.fingerprint, remove=True)
+        self.assertEqual(api.events, ['open', 'find_exact', 'delete', 'close'])
+
+    def test_removal_runs_in_bounded_embedded_python_helper(self):
+        with patch('livewatch.wechat_runtime.subprocess.run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            WindowsIntegration().certificate_remove(self.fingerprint)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0][0], sys.executable)
+        self.assertEqual(args[0][-1], self.fingerprint)
+        self.assertEqual(kwargs['timeout'], 30)
+        self.assertEqual(kwargs['creationflags'], subprocess.CREATE_NO_WINDOW)
+
+    def test_timeout_or_cancelled_confirmation_remains_actionable(self):
+        for outcome in (subprocess.TimeoutExpired('helper', 30), subprocess.CompletedProcess([], 1)):
+            with self.subTest(outcome=type(outcome).__name__):
+                options = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
+                with patch('livewatch.wechat_runtime.subprocess.run', **options):
+                    with self.assertRaisesRegex(CertificateConfirmationPending, 'Windows.*确认'):
+                        WindowsIntegration().certificate_remove(self.fingerprint)
+
+    def test_helper_exit_code_requires_certificate_absence(self):
+        for present in (True, False):
+            with patch.object(WindowsIntegration, '_certificate_action') as action, \
+                    patch.object(WindowsIntegration, 'certificate_present', return_value=present):
+                self.assertEqual(certificate_removal_main(self.fingerprint), 1 if present else 0)
+                action.assert_called_once_with(self.fingerprint, remove=True)
 
 
 class FakeLock:
@@ -117,6 +210,7 @@ class FakeRuntime(WechatRuntime):
         self.system.events.append('spawn')
         self.system.process = process = FakeProcess(self.system)
         self.system.record = {'pid': process.pid, 'image': str(self.executable.resolve()), 'created': '123456789'}
+        (self.workdir / 'wx_video_download.pid').write_text(str(process.pid), 'ascii')
         self.system.ports[2022] = process.pid
         return process
 
@@ -176,6 +270,7 @@ class RuntimeChecks(unittest.TestCase):
         self.assertEqual(self.system.registry, self.system.original)
         self.assertEqual(self.system.certificates, set())
         self.assertFalse(self.runtime.journal_path.exists())
+        self.assertFalse((self.runtime.workdir / 'wx_video_download.pid').exists())
         events = self.system.events[before:]
         self.assertLess(events.index('notify'), events.index('api:/api/service/stop'))
         self.assertLess(events.index('api:/api/service/stop'), events.index('terminate'))
@@ -192,6 +287,58 @@ class RuntimeChecks(unittest.TestCase):
         with self.assertRaises(RuntimeErrorSafe): self.runtime.start(self.script)
         self.assertNotIn('spawn', self.system.events)
         self.assertEqual(self.system.registry, self.system.original)
+
+    def test_start_clears_dead_stale_pid_and_can_restart(self):
+        self.runtime.workdir.mkdir(parents=True)
+        marker = self.runtime.workdir / 'wx_video_download.pid'
+        marker.write_text('30396', 'ascii')
+        self.runtime.start(self.script)
+        self.assertEqual(marker.read_text(), str(self.system.process.pid))
+        self.runtime.stop()
+        self.assertFalse(marker.exists())
+        self.runtime.start(self.script)
+        self.runtime.stop()
+        self.assertEqual(self.system.events.count('spawn'), 2)
+
+    def test_reused_stale_pid_never_terminates_unrelated_process(self):
+        self.runtime.workdir.mkdir(parents=True)
+        marker = self.runtime.workdir / 'wx_video_download.pid'
+        marker.write_text('30396', 'ascii')
+        unrelated = {'pid': 30396, 'image': str(self.root / 'another.exe'), 'created': '9988'}
+        original = self.system.process_key
+        with patch.object(self.system, 'process_key', side_effect=lambda pid: unrelated if pid == 30396 else original(pid)):
+            self.runtime.start(self.script)
+        self.assertNotIn('terminate', self.system.events)
+        self.assertEqual(marker.read_text(), str(self.system.process.pid))
+        self.runtime.stop()
+
+    def test_same_bridge_executable_with_live_pid_is_not_adopted(self):
+        self.runtime.workdir.mkdir(parents=True)
+        marker = self.runtime.workdir / 'wx_video_download.pid'
+        marker.write_text('30396', 'ascii')
+        live = {'pid': 30396, 'image': str(self.runtime.executable), 'created': '9988'}
+        with patch.object(self.system, 'process_key', return_value=live):
+            with self.assertRaisesRegex(RuntimeErrorSafe, '仍在运行'):
+                self.runtime.start(self.script)
+        self.assertEqual(marker.read_text(), '30396')
+        self.assertNotIn('spawn', self.system.events)
+        self.assertNotIn('terminate', self.system.events)
+
+    def test_cleanup_preserves_marker_for_different_pid(self):
+        self.runtime.start(self.script)
+        marker = self.runtime.workdir / 'wx_video_download.pid'
+        marker.write_text('30396', 'ascii')
+        self.runtime.stop()
+        self.assertEqual(marker.read_text(), '30396')
+
+    def test_invalid_pid_marker_is_preserved_without_starting(self):
+        self.runtime.workdir.mkdir(parents=True)
+        marker = self.runtime.workdir / 'wx_video_download.pid'
+        marker.write_text('../foreign', 'ascii')
+        with self.assertRaisesRegex(RuntimeErrorSafe, '记录无效'):
+            self.runtime.start(self.script)
+        self.assertEqual(marker.read_text(), '../foreign')
+        self.assertNotIn('spawn', self.system.events)
 
     def test_missing_bundle_is_safe_error(self):
         self.runtime.executable.unlink()
@@ -226,6 +373,21 @@ class RuntimeChecks(unittest.TestCase):
         self.assertEqual(self.system.registry, self.system.original)
         self.assertEqual(self.system.certificates, set())
 
+    def test_recovery_retries_notification_after_registry_was_restored(self):
+        self.runtime.start(self.script)
+        self.system.fail_notify = True
+        with self.assertRaisesRegex(RuntimeErrorSafe, '代理尚未恢复'):
+            self.runtime.stop()
+        self.assertEqual(self.system.registry, self.system.original)
+        self.assertTrue(self.runtime.journal_path.exists())
+        before = len(self.system.events)
+        recovered = FakeRuntime(self.root, bundle_root=self.root, system=self.system)
+        recovered.recover()
+        events = self.system.events[before:]
+        self.assertIn('notify', events, 'restored registry values must still refresh cached proxy settings')
+        self.assertFalse(any(event.startswith('registry:') for event in events))
+        self.assertFalse(recovered.journal_path.exists())
+
     def test_uncertain_certificate_install_is_undone(self):
         self.system.fail_add = True
         with self.assertRaises(RuntimeErrorSafe): self.runtime.start(self.script)
@@ -250,6 +412,45 @@ class RuntimeChecks(unittest.TestCase):
         recovered.recover()
         self.assertFalse(recovered.journal_path.exists())
         self.assertEqual(self.system.certificates, set())
+
+    def test_confirmation_timeout_keeps_journal_after_network_is_restored(self):
+        self.runtime.start(self.script)
+        with patch.object(self.system, 'certificate_remove', side_effect=CertificateConfirmationPending('Windows confirmation pending')):
+            with self.assertRaises(CertificateConfirmationPending):
+                self.runtime.stop()
+        self.assertEqual(self.system.registry, self.system.original)
+        self.assertFalse(self.system.process.alive)
+        self.assertTrue(self.runtime.journal_path.exists())
+        self.assertTrue(self.runtime.state['certificate_owned'])
+        self.assertTrue(self.runtime.state['certificate_confirmation_pending'])
+        self.runtime.stop()
+        self.assertFalse(self.runtime.journal_path.exists())
+
+    def test_startup_defers_existing_certificate_after_restoring_network(self):
+        self.runtime.start(self.script)
+        self.runtime._watchdog_stop.set()
+        self.runtime._release()
+        recovered = FakeRuntime(self.root, bundle_root=self.root, system=self.system)
+        with patch.object(self.system, 'certificate_remove', side_effect=AssertionError('No startup prompt')):
+            with self.assertRaisesRegex(CertificateConfirmationPending, '点击'):
+                recovered.recover(defer_certificate_confirmation=True)
+        self.assertEqual(self.system.registry, self.system.original)
+        self.assertFalse(self.system.process.alive)
+        self.assertTrue(recovered.state['certificate_confirmation_pending'])
+        recovered.stop()
+        self.assertFalse(recovered.journal_path.exists())
+
+    def test_startup_clears_journal_when_certificate_already_removed(self):
+        self.runtime.start(self.script)
+        self.runtime._watchdog_stop.set()
+        self.runtime._release()
+        self.system.certificates.clear()
+        recovered = FakeRuntime(self.root, bundle_root=self.root, system=self.system)
+        with patch.object(self.system, 'certificate_remove', side_effect=AssertionError('No startup prompt')):
+            recovered.recover(defer_certificate_confirmation=True)
+        self.assertEqual(self.system.registry, self.system.original)
+        self.assertFalse(self.system.process.alive)
+        self.assertFalse(recovered.journal_path.exists())
 
     def test_crash_recovery_uses_process_identity(self):
         self.runtime.start(self.script)
@@ -282,6 +483,7 @@ class RuntimeChecks(unittest.TestCase):
         self.assertFalse(self.runtime.journal_path.exists())
         self.assertEqual(self.system.registry, self.system.original)
         self.assertEqual(self.system.certificates, set())
+        self.assertFalse((self.runtime.workdir / 'wx_video_download.pid').exists())
         self.assertIn('意外退出', self.runtime.last_error)
 
     def test_invalid_recovery_record_causes_no_system_writes(self):
@@ -311,6 +513,29 @@ class RuntimeChecks(unittest.TestCase):
         with patch('livewatch.wechat_runtime.WechatRuntime', return_value=recovered):
             guardian_main(str(self.root), str(self.root), '0' * 32)
         self.assertEqual(self.system.events, before)
+        self.runtime.stop()
+
+    def test_guard_does_not_repeat_cancelled_confirmation(self):
+        self.runtime.start(self.script)
+        token = self.runtime.state['guard_token']
+        recovered = FakeRuntime(self.root, bundle_root=self.root, system=self.system)
+        with patch('livewatch.wechat_runtime.WechatRuntime', return_value=recovered), \
+                patch.object(self.system, 'process_key', return_value=None), \
+                patch.object(recovered, 'recover', side_effect=CertificateConfirmationPending('confirmation pending')) as recover:
+            guardian_main(str(self.root), str(self.root), token)
+        recover.assert_called_once_with()
+        self.runtime.stop()
+
+    def test_guard_leaves_previously_cancelled_confirmation_for_user_retry(self):
+        self.runtime.start(self.script)
+        self.runtime.state['certificate_confirmation_pending'] = True
+        self.runtime._save()
+        token = self.runtime.state['guard_token']
+        recovered = FakeRuntime(self.root, bundle_root=self.root, system=self.system)
+        with patch('livewatch.wechat_runtime.WechatRuntime', return_value=recovered), \
+                patch.object(recovered, 'recover') as recover:
+            guardian_main(str(self.root), str(self.root), token)
+        recover.assert_not_called()
         self.runtime.stop()
 
     def test_reparse_certificate_directory_rejected_before_acl(self):

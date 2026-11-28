@@ -34,6 +34,10 @@ class RuntimeErrorSafe(RuntimeError):
     """A message safe for the application UI; never includes command output."""
 
 
+class CertificateConfirmationPending(RuntimeErrorSafe):
+    """Windows needs a human certificate-removal confirmation before recovery."""
+
+
 class _WindowsJob:
     def __init__(self, kernel, handle):
         self.kernel, self.handle = kernel, handle
@@ -263,16 +267,20 @@ class WindowsIntegration:
             kernel.CloseHandle(handle)
 
     @staticmethod
-    def certificate_present(fingerprint):
-        # Only CurrentUser\\Root. Looking at a merged trust view could mistake a
-        # machine certificate for one owned by this activation.
+    def _certificate_action(fingerprint, remove=False):
+        # Open the physical CurrentUser registry store, not the logical SYSTEM
+        # store which can also inherit machine roots. Only the exact journaled
+        # certificate is eligible for removal; never run certutil's CLI here.
+        if not isinstance(fingerprint, str) or not re.fullmatch(r'[A-Fa-f0-9]{40}', fingerprint):
+            raise RuntimeErrorSafe('视频号证书指纹无效。')
         from ctypes import wintypes
         crypt = ctypes.WinDLL('crypt32', use_last_error=True)
         crypt.CertOpenStore.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
                                       wintypes.DWORD, ctypes.c_void_p]
         crypt.CertOpenStore.restype = ctypes.c_void_p
         name = ctypes.create_unicode_buffer('ROOT')
-        store = crypt.CertOpenStore(ctypes.c_void_p(10), 0, None, 0x10000 | 0x4000, name)
+        # CERT_STORE_PROV_SYSTEM_REGISTRY_W, CURRENT_USER, OPEN_EXISTING.
+        store = crypt.CertOpenStore(ctypes.c_void_p(13), 0, None, 0x10000 | 0x4000, name)
         if not store:
             raise RuntimeErrorSafe('无法读取当前用户的证书状态。')
         class Blob(ctypes.Structure):
@@ -284,21 +292,54 @@ class WindowsIntegration:
             wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
         crypt.CertFindCertificateInStore.restype = ctypes.c_void_p
         crypt.CertFreeCertificateContext.argtypes = [ctypes.c_void_p]
+        crypt.CertDeleteCertificateFromStore.argtypes = [ctypes.c_void_p]
+        crypt.CertDeleteCertificateFromStore.restype = wintypes.BOOL
         crypt.CertCloseStore.argtypes = [ctypes.c_void_p, wintypes.DWORD]
         try:
             certificate = crypt.CertFindCertificateInStore(store, 0x10001, 0, 0x10000, ctypes.byref(blob), None)
             if certificate:
-                crypt.CertFreeCertificateContext(certificate)
+                if remove:
+                    # The delete API consumes the context even when it fails.
+                    if not crypt.CertDeleteCertificateFromStore(certificate):
+                        raise RuntimeErrorSafe('无法移除本次视频号证书，已保留恢复记录。')
+                else:
+                    crypt.CertFreeCertificateContext(certificate)
                 return True
+            if ctypes.get_last_error() & 0xffffffff != 0x80092004:  # CRYPT_E_NOT_FOUND
+                raise RuntimeErrorSafe('无法确认当前用户的视频号证书状态。')
             return False
         finally:
             crypt.CertCloseStore(store, 0)
+
+    @staticmethod
+    def certificate_present(fingerprint):
+        return WindowsIntegration._certificate_action(fingerprint)
 
     def certificate_add(self, path):
         self._run('certutil.exe', ['-user', '-addstore', 'Root', str(path)])
 
     def certificate_remove(self, fingerprint):
-        self._run('certutil.exe', ['-user', '-delstore', 'Root', fingerprint])
+        if not isinstance(fingerprint, str) or not re.fullmatch(r'[A-Fa-f0-9]{40}', fingerprint):
+            raise RuntimeErrorSafe('视频号证书指纹无效。')
+        # CurrentUser Root deletion can show a Windows confirmation dialog.
+        # Keep that supported flow, but isolate it so ignoring the dialog cannot
+        # indefinitely block application shutdown or network restoration.
+        command = ('import sys;sys.path.insert(0,sys.argv[1]);'
+                   'from livewatch.wechat_runtime import certificate_removal_main;'
+                   'sys.exit(certificate_removal_main(sys.argv[2]))')
+        try:
+            result = subprocess.run([sys.executable, '-B', '-c', command,
+                str(Path(__file__).resolve().parents[1]), fingerprint],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=30, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except subprocess.TimeoutExpired:
+            raise CertificateConfirmationPending(
+                'Windows 证书移除确认已超时。请重试“关闭桥接并恢复网络”，并在 Windows 确认窗口点击“是”。') from None
+        except OSError:
+            raise RuntimeErrorSafe('无法启动视频号证书移除，请重试关闭桥接。') from None
+        if result.returncode:
+            raise CertificateConfirmationPending(
+                'Windows 尚未确认移除本次视频号证书。请重试“关闭桥接并恢复网络”，并在 Windows 确认窗口点击“是”。')
 
 
 class WechatRuntime:
@@ -344,8 +385,9 @@ class WechatRuntime:
                 self.last_error = '视频号服务意外退出，已恢复本机网络设置，请重新启动捕获。'
                 try:
                     self._cleanup()
-                except Exception:
-                    self.last_error = '视频号服务意外退出，部分设置尚未恢复，请重新启动软件恢复。'
+                except Exception as exc:
+                    self.last_error = ('视频号服务意外退出。' + str(exc) if isinstance(exc, RuntimeErrorSafe)
+                                       else '视频号服务意外退出，部分设置尚未恢复，请重新启动软件恢复。')
                 finally:
                     self._release()
             return
@@ -370,6 +412,53 @@ class WechatRuntime:
         if self.file_lock is not None:
             self.file_lock.close()
             self.file_lock = None
+
+    def _clear_stale_pid_file(self, owned_record=None):
+        """Remove only our bridge's stale marker while holding the workdir lock.
+
+        Never signal a process based on this PID-only file. During cleanup only
+        the recorded activation's PID is eligible; startup also accepts a dead
+        PID or one now used by an unrelated executable.
+        """
+        if self.file_lock is None:
+            raise RuntimeErrorSafe('视频号进程记录清理缺少目录锁。')
+        path = self.workdir / 'wx_video_download.pid'
+        try:
+            if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
+                raise RuntimeErrorSafe('视频号进程记录不能是链接。')
+            info = path.stat()
+            if info.st_size > 32 or path.resolve().parent != self.workdir.resolve():
+                raise RuntimeErrorSafe('视频号进程记录无效，请检查运行目录。')
+            content = path.read_text('ascii')
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeError):
+            raise RuntimeErrorSafe('无法读取视频号进程记录，请重试捕获。') from None
+        text = content.strip()
+        if not re.fullmatch(r'[0-9]{1,10}', text) or not 0 < int(text) <= 0xffffffff:
+            raise RuntimeErrorSafe('视频号进程记录无效，请检查运行目录。')
+        pid = int(text)
+        if owned_record is not None and pid != owned_record['pid']:
+            return  # Another activation's marker is not ours to remove here.
+        current = self.system.process_key(pid)
+        if owned_record is not None:
+            if current == owned_record:
+                raise RuntimeErrorSafe('本次视频号服务尚未退出，已保留进程记录。')
+        elif current and Path(current['image']).resolve() == self.executable.resolve():
+            raise RuntimeErrorSafe('视频号进程记录对应的服务仍在运行，请先关闭该服务。')
+        # A file can be replaced by the upstream process as it exits. Do not
+        # erase a different marker even though this application holds its lock.
+        try:
+            latest = path.stat()
+            if (latest.st_ino, latest.st_mtime_ns, latest.st_size) != (info.st_ino, info.st_mtime_ns, info.st_size):
+                raise RuntimeErrorSafe('视频号进程记录已变化，请重试捕获。')
+            if path.read_text('ascii') != content:
+                raise RuntimeErrorSafe('视频号进程记录已变化，请重试捕获。')
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            raise RuntimeErrorSafe('无法清理视频号旧进程记录，请重试捕获。') from None
 
     def _save(self):
         temporary = self.journal_path.with_suffix('.tmp')
@@ -535,14 +624,19 @@ class WechatRuntime:
             for name in reversed(names):
                 if current.get(name) == PROXY_VALUES[name]:
                     self.system.registry_write(name, backup[name])
-            self.system.notify_proxy()
+        # A previous recovery can restore all values and then fail to notify
+        # WinINet. In that case ProxyServer no longer matches ours, but its
+        # cached settings still need refreshing before the journal is cleared.
+        # Refreshing also respects any values the user has changed since then.
+        self.system.notify_proxy()
         self.state['proxy_keys'] = []
         self.state['proxy_backup'] = None
         self._save()
 
-    def _cleanup(self):
+    def _cleanup(self, defer_certificate_confirmation=False):
         self._watchdog_stop.set()
         errors = []
+        confirmation_pending = False
         try:
             self._restore_proxy()
         except Exception:
@@ -573,6 +667,8 @@ class WechatRuntime:
                     self.process.wait(timeout=3)
                 elif self.state.get('process') and self.system.process_key(self.state['process']['pid']) == self.state['process']:
                     raise termination_error
+            if self.state.get('process'):
+                self._clear_stale_pid_file(self.state['process'])
             self.state['process'] = None
             self._save()
         except Exception:
@@ -580,14 +676,25 @@ class WechatRuntime:
         fingerprint = self.state.get('certificate')
         if fingerprint and self.state.get('certificate_owned'):
             try:
+                self.state['certificate_confirmation_pending'] = False
+                self._save()
                 if self.system.certificate_present(fingerprint):
+                    if defer_certificate_confirmation:
+                        raise CertificateConfirmationPending(
+                            '本次视频号证书仍待移除。请点击“关闭桥接并恢复网络”，并在 Windows 确认窗口点击“是”。')
                     self.system.certificate_remove(fingerprint)
                 if self.system.certificate_present(fingerprint):
                     raise RuntimeErrorSafe('证书仍然存在')
                 self.state['certificate_owned'] = False
                 self._save()
-            except Exception:
-                errors.append('本次视频号证书尚未移除')
+            except Exception as exc:
+                if isinstance(exc, CertificateConfirmationPending):
+                    confirmation_pending = True
+                    self.state['certificate_confirmation_pending'] = True
+                    self._save()
+                    errors.append(str(exc))
+                else:
+                    errors.append('本次视频号证书尚未移除')
         self.running = False
         if not errors:
             self.journal_path.unlink(missing_ok=True)
@@ -598,9 +705,10 @@ class WechatRuntime:
                 except subprocess.TimeoutExpired: pass
                 self.guard = None
         if errors:
-            raise RuntimeErrorSafe('；'.join(errors) + '。已保存恢复记录，请重新启动软件恢复。')
+            error_type = CertificateConfirmationPending if confirmation_pending else RuntimeErrorSafe
+            raise error_type('；'.join(errors) + ' 已保存恢复记录，可重试关闭桥接或重新启动软件恢复。')
 
-    def recover(self):
+    def recover(self, defer_certificate_confirmation=False):
         """Undo an interrupted activation. Refuse if another instance owns it."""
         with self.lock:
             if self.running:
@@ -609,7 +717,7 @@ class WechatRuntime:
             try:
                 self.state = self._load()
                 if self.state:
-                    self._cleanup()
+                    self._cleanup(defer_certificate_confirmation=defer_certificate_confirmation)
                 return self.snapshot()
             finally:
                 self._release()
@@ -630,6 +738,7 @@ class WechatRuntime:
                     raise RuntimeErrorSafe('视频号捕获脚本尚未准备好。')
                 if self.system.listener_pid(2022) or self.system.listener_pid(2023):
                     raise RuntimeErrorSafe('视频号使用的 2022 或 2023 端口已被占用，请先关闭占用程序。')
+                self._clear_stale_pid_file()
                 certs = self._safe_certs_directory()
                 self.system.secure_directory(self.workdir)
                 certs.mkdir(exist_ok=True)
@@ -675,7 +784,7 @@ class WechatRuntime:
                 return self.snapshot()
             except Exception as exc:
                 safe = str(exc) if isinstance(exc, RuntimeErrorSafe) else '内置视频号捕获启动失败。'
-                if self.state:
+                if self.state and not isinstance(exc, CertificateConfirmationPending):
                     try: self._cleanup()
                     except RuntimeErrorSafe as cleanup: safe += ' ' + str(cleanup)
                 self._release()
@@ -695,6 +804,22 @@ class WechatRuntime:
                 self._release()
 
 
+def certificate_removal_main(fingerprint):
+    """Bounded by the parent; this helper changes only one CurrentUser root."""
+    # Keep a bound even if the backend is killed while the Windows dialog is
+    # open. WinDLL releases the GIL, so this timer can end the isolated helper.
+    deadline = threading.Timer(30, lambda: os._exit(2))
+    deadline.daemon = True
+    deadline.start()
+    try:
+        WindowsIntegration._certificate_action(fingerprint, remove=True)
+        return 1 if WindowsIntegration.certificate_present(fingerprint) else 0
+    except Exception:
+        return 1
+    finally:
+        deadline.cancel()
+
+
 def guardian_main(root, bundle_root, token):
     """Hidden helper: recover only this activation after its exact owner exits."""
     if not re.fullmatch(r'[0-9a-f]{32}', token):
@@ -706,6 +831,8 @@ def guardian_main(root, bundle_root, token):
             state = runtime._load()
             if state is None or state.get('guard_token') != token:
                 return
+            if state.get('certificate_confirmation_pending'):
+                return
             owner = state.get('owner')
             if not isinstance(owner, dict) or type(owner.get('pid')) is not int:
                 return
@@ -713,6 +840,10 @@ def guardian_main(root, bundle_root, token):
                 time.sleep(.25)
                 continue
             runtime.recover()
+            return
+        except CertificateConfirmationPending:
+            # Cancellation/timeout needs a user-initiated retry, not three
+            # consecutive confirmation dialogs after the window has exited.
             return
         except Exception:
             # A dying owner may not have released its file lock yet. Retrying

@@ -7,6 +7,7 @@ from .storage import now_iso
 from .media_options import recording_directory
 from .recording_paths import safe_nickname, recording_room_directory, recording_output_path
 from .recording_ts import TransportStreamWriter
+from .wechat_media import WechatFlvRelay, needs_flv_relay
 
 def safe_message(value, secrets=()):
     text=str(value)
@@ -141,6 +142,9 @@ class Recorder:
     def executable(self,settings):
         configured=settings.get('ffmpeg_path','').strip()
         candidates=[Path(configured)] if configured else [self.root/'tools'/'ffmpeg.exe',self.root/'tools'/'ffmpeg'/'ffmpeg.exe',self.root/'tools'/'ffmpeg']
+        if not configured:
+            # --data-dir separates writable user data from the packaged tools.
+            candidates.append(Path(__file__).resolve().parents[2]/'tools'/'ffmpeg.exe')
         for path in candidates:
             if path.is_file(): return str(path.resolve())
         if not configured: return shutil.which('ffmpeg') or ''
@@ -199,7 +203,10 @@ class Recorder:
             log=self.root/'logs'/('record_'+rid[:8]+'_'+stamp+'.log')
             log.parent.mkdir(parents=True,exist_ok=True)
             args=[binary,'-hide_banner','-loglevel','warning','-nostats','-progress','pipe:1' if segmented else 'pipe:2','-n','-rw_timeout','15000000']
-            args+=self._http_reconnect_args(binary)
+            # A relay connection is one source acquisition; reconnecting its
+            # local URL can replay a finite source and conceal an upstream EOF.
+            # Let the engine refresh the signed URL and resume the same TS file.
+            if not needs_flv_relay(room,url): args+=self._http_reconnect_args(binary)
             if headers:
                 for key,value in headers.items():
                     if any(c in str(key)+str(value) for c in ['\r','\n','\x00']): raise ValueError('请求头包含无效字符')
@@ -209,18 +216,23 @@ class Recorder:
                 args+=['-f','segment','-segment_format','mpegts','-segment_time',str(settings.get('record_segment_seconds',1800)),'-reset_timestamps','1','-segment_list','pipe:1','-segment_list_type','csv',pattern]
             else:
                 args+=['-muxdelay','0','-muxpreload','0','-avoid_negative_ts','disabled','-output_ts_offset','1','-mpegts_flags','+initial_discontinuity','-f','mpegts','pipe:1']
-            handle=None;writer=None
+            handle=None;writer=None;relay=None
             try:
                 if not segmented:
                     handle=self._open_output(output,resume)
                     writer=TransportStreamWriter(handle,resume=bool(resume),reference_timestamp=(resume or {}).get('timestamp_reference'))
+                if needs_flv_relay(room,url):
+                    relay=WechatFlvRelay(url,headers)
+                    args[args.index('-i')+1]=relay.url
                 process=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),shell=False)
             except Exception:
+                if relay: relay.close()
                 if handle: handle.close()
                 raise
             try: self._own_process(process)
             except Exception:
                 process.kill();process.communicate(timeout=5)
+                if relay: relay.close()
                 if handle: handle.close()
                 raise
             previous=resume or {}
@@ -236,9 +248,11 @@ class Recorder:
                         except Exception: job['log_error']='录制任务暂时无法保存，媒体读取继续'
                 writer.on_write=media_written
             self.jobs[rid]=job
+            job['media_relay']=relay
             try: self._save_task(rid,job,'starting',force=True)
             except Exception:
                 process.kill();process.communicate(timeout=5);self.jobs.pop(rid,None)
+                if relay: relay.close()
                 if handle: handle.close()
                 raise
             if self.maintenance:
@@ -401,6 +415,7 @@ class Recorder:
                     if process.poll() is None: raise
                 process.wait(timeout=3)
         if process.poll() is None: raise RuntimeError('录制进程尚未退出，文件继续受保护')
+        if job.get('media_relay'): job['media_relay'].close()
         for thread in job.get('threads',[]):
             # A reader can have been constructed but not started if startup
             # ran out of threads. It owns no active work and cannot be joined.

@@ -9,6 +9,7 @@ import time
 from .providers import _source_headers, validate_headers, validate_url
 from .recorder import Recorder
 from .media_options import select_stream
+from .wechat_media import WechatFlvRelay, needs_flv_relay
 
 
 class Playback:
@@ -36,7 +37,7 @@ class Playback:
             if len(self.sessions) >= 4:
                 raise ValueError('最多同时打开 4 个直播画面，请先关闭一个。')
             key = secrets.token_urlsafe(24)
-            self.sessions[key] = dict(url=url, headers=headers, executable=str(executable), process=None, created=time.monotonic(), state='ready', bytes=0, nickname=room.get('nickname') or '直播画面')
+            self.sessions[key] = dict(url=url, headers=headers, executable=str(executable), process=None, created=time.monotonic(), state='ready', bytes=0, nickname=room.get('nickname') or '直播画面', normalize_flv=needs_flv_relay(room,url), relay=None)
             label = selected.get('label') or {'origin':'原画','blue':'蓝光','ultra':'超清','high':'高清','standard':'标清','low':'流畅'}.get(selected.get('quality'), '当前直播源')
             return {'id': key, 'nickname': self.sessions[key]['nickname'], 'quality': label, 'stream_path': '/api/playback/' + key + '/stream.mp4'}
 
@@ -61,8 +62,13 @@ class Playback:
                      '-pix_fmt', 'yuv420p', '-g', '50', '-keyint_min', '25', '-c:a', 'aac', '-b:a', '128k', '-threads', '2',
                      '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '1000000', '-f', 'mp4', 'pipe:1']
             try:
+                if session['normalize_flv']:
+                    session['relay'] = WechatFlvRelay(session['url'], session['headers'])
+                    args[args.index('-i')+1] = session['relay'].url
                 process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             except OSError:
+                if session['relay']:
+                    session['relay'].close()
                 session['state'] = 'failed'
                 raise ValueError('无法启动直播播放器，请检查 FFmpeg 配置。') from None
             session.update(process=process, state='connecting')
@@ -84,6 +90,9 @@ class Playback:
 
     @staticmethod
     def _stop(session):
+        if session.get('relay'):
+            session['relay'].close()
+            session['relay'] = None
         process = session.get('process')
         if process:
             if process.poll() is None:

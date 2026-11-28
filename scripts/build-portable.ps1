@@ -69,6 +69,7 @@ $bridgeRoot = Join-Path $projectRoot 'tools\wechat-bridge'
 $bridgeExecutable = Join-Path $bridgeRoot 'wx_video_download.exe'
 if (Test-Path -LiteralPath $bridgeExecutable -PathType Leaf) {
     if (-not (Test-Path -LiteralPath (Join-Path $bridgeRoot 'LICENSE') -PathType Leaf)) { throw 'The bundled WeChat bridge requires its LICENSE.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $bridgeRoot 'download-manifest.json') -PathType Leaf)) { throw 'The bundled WeChat bridge requires its verified download-manifest.json.' }
     $bridgeTarget = Join-Path $packagedTools 'wechat-bridge'
     New-Item -ItemType Directory -Path $bridgeTarget -Force | Out-Null
     foreach ($name in @('wx_video_download.exe', 'LICENSE', 'VERSION.txt', 'download-manifest.json')) {
@@ -101,7 +102,8 @@ $documentNames = @(
     @(0x7B2C,0x4E09,0x65B9,0x7EC4,0x4EF6,0x8BF4,0x660E),
     @(0x624B,0x673A,0x5206,0x4EAB,0x94FE,0x63A5,0x89E3,0x6790),
     @(0x5F02,0x5E38,0x6062,0x590D,0x4E0E,0x5A92,0x4F53,0x8BBE,0x7F6E),
-    @(0x68C0,0x6D4B,0x8D85,0x65F6,0x6062,0x590D,0x4E0E,0x4EA4,0x4ED8)
+    @(0x68C0,0x6D4B,0x8D85,0x65F6,0x6062,0x590D,0x4E0E,0x4EA4,0x4ED8),
+    @(0x89C6,0x9891,0x53F7,0x6293,0x53D6,0x4E0E,0x76D1,0x63A7,0x65B9,0x6848)
 )
 for ($index = 0; $index -lt $documentNames.Count; $index++) {
     $name = -join @($documentNames[$index] | ForEach-Object { [char]$_ })

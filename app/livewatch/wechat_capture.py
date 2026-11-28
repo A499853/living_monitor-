@@ -93,7 +93,9 @@ class WechatCapture:
         self.runtime = WechatRuntime(self.root)
         self.runtime_error = ''
         try:
-            self.runtime.recover()
+            # Restore networking promptly at startup. Any remaining Windows
+            # certificate confirmation is retried explicitly from this panel.
+            self.runtime.recover(defer_certificate_confirmation=True)
         except RuntimeErrorSafe as exc:
             self.runtime_error = str(exc)
 
