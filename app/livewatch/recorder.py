@@ -1,44 +1,18 @@
 from __future__ import annotations
-import concurrent.futures, csv, logging, os, re, shutil, sqlite3, subprocess, threading, time, uuid
+import concurrent.futures, csv, hashlib, logging, os, re, shutil, sqlite3, stat, subprocess, threading, time, uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
-from .storage import room_directory, now_iso
+from .storage import now_iso
 from .media_options import recording_directory
+from .recording_paths import safe_nickname, recording_room_directory, recording_output_path
+from .recording_ts import TransportStreamWriter
 
 def safe_message(value, secrets=()):
     text=str(value)
     for secret in sorted((s for s in secrets if isinstance(s,str) and s),key=len,reverse=True): text=text.replace(secret,'[已隐藏]')
     text=re.sub(r'https?://[^\s\]<>"\']+', '[链接已隐藏]', text)
     return text[:2000]
-
-def safe_nickname(value,limit=72):
-    value=re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', '_', str(value or ''))
-    value=''.join(c for c in value if not 0xD800<=ord(c)<=0xDFFF)
-    value=re.sub(r'\s+', ' ', value).strip(' .')
-    value=value[:limit].rstrip(' .') or '未命名直播间'
-    if re.fullmatch(r'(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?',value): value='_'+value
-    return value
-
-
-def recording_output_path(directory,nickname,when=None):
-    directory=Path(directory)
-    stamp=(when or datetime.now()).strftime('%Y-%m-%d_%H-%M-%S')
-    nickname=safe_nickname(nickname)
-    # Reserve room for the extension/collision suffix under the conventional
-    # Windows path limit; Unicode astral characters consume two UTF-16 units.
-    def units(value): return len(str(value).encode('utf-16-le'))//2
-    budget=min(72,240-units(directory.resolve())-len(stamp)-12)
-    if budget<8: raise ValueError('软件目录路径过长，请移动到较短的目录后重新录制')
-    while units(nickname)>budget: nickname=nickname[:-1]
-    nickname=nickname.rstrip(' .') or '直播间'
-    stem=stamp+'_'+nickname
-    for number in range(10000):
-        suffix='' if number==0 else f'_{number:03d}'
-        output=directory/(stem+suffix+'.ts')
-        if not output.exists() and not output.with_name(output.stem+'_000000.ts').exists(): return output
-    raise ValueError('同一时间的录制文件数量过多，请更换保存目录')
-
 
 class Recorder:
     STOP_MAX_ATTEMPTS=3
@@ -86,8 +60,48 @@ class Recorder:
         now=time.monotonic()
         if not force and now-job.get('persisted_at',0)<5: return
         path=job['path'] if Path(job['path']).exists() else job.get('last_segment_path') or job['path']
-        store.save_record_task(room_id,dict(task_id=job['task_id'],state=state,path=path,duration_seconds=job['duration_seconds'],last_media_write_at=job['last_media_write_at'],bytes_written=job['bytes_written'],segment_count=job['segment_count'],process_id=job['process'].pid))
+        store.save_record_task(room_id,dict(task_id=job['task_id'],state=state,path=path,duration_seconds=job['duration_seconds'],last_media_write_at=job['last_media_write_at'],bytes_written=job['bytes_written'],segment_count=job['segment_count'],process_id=job['process'].pid,resume=self._resume_info(job)))
         job['persisted_at']=now
+    def _resume_info(self,job):
+        if job.get('pattern')!='': return None
+        try:
+            info=Path(job['path']).stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_size<188: return None
+        except OSError: return None
+        try:
+            with Path(job['path']).open('rb') as handle:
+                handle.seek(max(0,info.st_size-8192))
+                checkpoint_hash=hashlib.sha256(handle.read(min(8192,info.st_size))).hexdigest()
+        except OSError: return None
+        return dict(path=job['path'],task_id=job['task_id'],device=str(info.st_dev),inode=str(info.st_ino),
+                    size=info.st_size,modified_ns=str(info.st_mtime_ns),duration_seconds=job['duration_seconds'],
+                    last_media_write_at=job['last_media_write_at'],timestamp_reference=job.get('timestamp_reference'),
+                    checkpoint=not job.get('output_closed',False),checkpoint_hash=checkpoint_hash)
+    def _open_output(self,path,resume):
+        """Open exactly the owned file; recovery must never truncate or replace it."""
+        if self.maintenance: self.maintenance._path(path,'recording')
+        if not resume: return path.open('xb',buffering=0)
+        descriptor=os.open(path,os.O_RDWR|os.O_APPEND|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0))
+        try:
+            info=os.fstat(descriptor)
+            same_file=(str(info.st_dev),str(info.st_ino))==(resume['device'],resume['inode'])
+            unchanged=info.st_size==resume['size'] and str(info.st_mtime_ns)==resume['modified_ns']
+            grew=resume.get('checkpoint') and info.st_size>=resume['size']
+            if not same_file or not (unchanged or grew) or not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
+                raise ValueError('续录文件已被替换或修改，已保留原文件并等待处理')
+            handle=os.fdopen(descriptor,'r+b',buffering=0);descriptor=None
+            if grew:
+                handle.seek(max(0,resume['size']-8192))
+                digest=hashlib.sha256(handle.read(min(8192,resume['size']))).hexdigest()
+                if not resume.get('checkpoint_hash') or digest!=resume['checkpoint_hash']:
+                    handle.close()
+                    raise ValueError('续录检查点内容已更改，已保留原文件并等待处理')
+                if info.st_size%188:
+                    handle.truncate(info.st_size-info.st_size%188)
+            handle.seek(0,os.SEEK_END)
+            return handle
+        finally:
+            if descriptor is not None: os.close(descriptor)
     def _media_progress(self,job,duration):
         """A live process/progress line is insufficient: media time AND disk grow."""
         try: size=Path(job['path']).stat().st_size
@@ -174,31 +188,58 @@ class Recorder:
             binary=self.executable(settings)
             if not binary: raise ValueError('未找到 FFmpeg，请在设置中配置 ffmpeg.exe')
             if urlsplit(url).scheme not in ['http','https']: raise ValueError('录制源必须为 HTTP(S) 地址')
-            directory=recording_directory(self.root,settings,room)/room_directory(room)
+            segmented=bool(settings.get('record_segment_enabled',False))
+            resume=settings.get('_record_resume') if not segmented else None
+            directory=Path(resume['path']).parent if resume else recording_directory(self.root,settings,room)/recording_room_directory(room)
             directory.mkdir(parents=True,exist_ok=True)
             stamp=datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-            output=recording_output_path(directory,room.get('nickname') or '未命名直播间')
-            pattern=str(output.with_suffix('')).replace('%','%%')+'_%06d.ts'
-            output=Path(pattern % 0)
+            output=Path(resume['path']) if resume else recording_output_path(directory)
+            pattern=str(output.with_suffix('')).replace('%','%%')+'_%06d.ts' if segmented else ''
+            if segmented: output=Path(pattern % 0)
             log=self.root/'logs'/('record_'+rid[:8]+'_'+stamp+'.log')
             log.parent.mkdir(parents=True,exist_ok=True)
-            args=[binary,'-hide_banner','-loglevel','warning','-nostats','-progress','pipe:1','-n','-rw_timeout','15000000']
+            args=[binary,'-hide_banner','-loglevel','warning','-nostats','-progress','pipe:1' if segmented else 'pipe:2','-n','-rw_timeout','15000000']
             args+=self._http_reconnect_args(binary)
             if headers:
                 for key,value in headers.items():
                     if any(c in str(key)+str(value) for c in ['\r','\n','\x00']): raise ValueError('请求头包含无效字符')
                 args+=['-headers',''.join(f'{k}: {v}\r\n' for k,v in headers.items())]
-            args+=['-i',url,'-map','0:v?','-map','0:a?','-c','copy','-f','segment','-segment_format','mpegts','-segment_time',str(settings.get('record_segment_seconds',1800)),'-reset_timestamps','1','-segment_list','pipe:1','-segment_list_type','csv',pattern]
-            process=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),shell=False)
+            args+=['-i',url,'-map','0:v?','-map','0:a?','-c','copy']
+            if segmented:
+                args+=['-f','segment','-segment_format','mpegts','-segment_time',str(settings.get('record_segment_seconds',1800)),'-reset_timestamps','1','-segment_list','pipe:1','-segment_list_type','csv',pattern]
+            else:
+                args+=['-muxdelay','0','-muxpreload','0','-avoid_negative_ts','disabled','-output_ts_offset','1','-mpegts_flags','+initial_discontinuity','-f','mpegts','pipe:1']
+            handle=None;writer=None
+            try:
+                if not segmented:
+                    handle=self._open_output(output,resume)
+                    writer=TransportStreamWriter(handle,resume=bool(resume),reference_timestamp=(resume or {}).get('timestamp_reference'))
+                process=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),shell=False)
+            except Exception:
+                if handle: handle.close()
+                raise
             try: self._own_process(process)
             except Exception:
                 process.kill();process.communicate(timeout=5)
+                if handle: handle.close()
                 raise
-            job={'process':process,'path':str(output),'duration_seconds':0,'started':time.monotonic(),'stopping':False,'error':'','reported':False,'log':str(log),'has_media':False,'last_progress':time.monotonic(),'last_media_write_at':'','bytes_written':0,'validated_bytes':0,'validated_duration':0,'closed_bytes':0,'segment_count':0,'pattern':pattern,'last_segment_path':'','task_id':uuid.uuid4().hex}
+            previous=resume or {}
+            base_duration=previous.get('duration_seconds',0)
+            job={'process':process,'path':str(output),'duration_seconds':base_duration,'duration_offset':base_duration,'started':time.monotonic(),'stopping':False,'error':'','reported':False,'log':str(log),'has_media':False,'last_progress':time.monotonic(),'last_media_write_at':previous.get('last_media_write_at',''),'bytes_written':previous.get('size',0),'validated_bytes':previous.get('size',0),'validated_duration':base_duration,'closed_bytes':0,'segment_count':0,'pattern':pattern,'last_segment_path':'','task_id':previous.get('task_id') or uuid.uuid4().hex,'output_handle':handle,'ts_writer':writer,'timestamp_reference':previous.get('timestamp_reference')}
+            if writer:
+                def media_written(_count):
+                    with self.lock:
+                        first_media=not job['has_media']
+                        job['timestamp_reference']=writer.reference_timestamp
+                        self._media_progress(job,max(base_duration,writer.duration_seconds))
+                        try: self._save_task(rid,job,'recording' if job['has_media'] else 'starting',force=first_media and job['has_media'])
+                        except Exception: job['log_error']='录制任务暂时无法保存，媒体读取继续'
+                writer.on_write=media_written
             self.jobs[rid]=job
             try: self._save_task(rid,job,'starting',force=True)
             except Exception:
                 process.kill();process.communicate(timeout=5);self.jobs.pop(rid,None)
+                if handle: handle.close()
                 raise
             if self.maintenance:
                 try:
@@ -210,6 +251,21 @@ class Recorder:
             secrets=list(headers.values())+[url]
             def read_progress():
                 try:
+                    if not segmented:
+                        while True:
+                            chunk=process.stdout.read1(188*1024)
+                            if not chunk: break
+                            try:
+                                with self.lock: writer.write(chunk)
+                            except (OSError,ValueError) as exc:
+                                with self.lock:
+                                    job['error']='续录文件写入失败：'+safe_message(exc)
+                                    job['write_error']=True
+                                process.kill()
+                                break
+                        with self.lock: writer.finish()
+                        with self.lock: self._media_progress(job,job['duration_seconds'])
+                        return
                     for raw in iter(process.stdout.readline,b''):
                         line=raw.decode('utf-8','replace').strip()
                         if line.startswith('out_time_us='):
@@ -220,11 +276,18 @@ class Recorder:
                                     try: self._save_task(rid,job,'recording' if job['has_media'] else 'starting')
                                     except Exception: job['log_error']='录制任务暂时无法保存，媒体读取继续'
                             except ValueError: pass
-                        elif ',' in line:
+                        elif segmented and ',' in line:
                             with self.lock:
                                 try: self._segment_closed(job,line)
                                 except (OSError,ValueError): job['log_error']='录制片段登记暂时失败，保留文件'
-                finally: process.stdout.close()
+                except (OSError,ValueError) as exc:
+                    with self.lock:
+                        job['error']='续录文件写入失败：'+safe_message(exc)
+                        job['write_error']=True
+                    if process.poll() is None: process.kill()
+                finally:
+                    if handle: handle.close()
+                    process.stdout.close()
             def read_errors():
                 handle=None
                 try:
@@ -232,9 +295,13 @@ class Recorder:
                     except OSError:
                         with self.lock: job['log_error']='录制日志暂时无法写入'
                     for raw in iter(process.stderr.readline,b''):
-                        line=safe_message(raw.decode('utf-8','replace').strip(),secrets)
+                        raw_line=raw.decode('utf-8','replace').strip()
+                        if not segmented and re.match(r'^(?:frame|fps|stream_\d+_\d+_q|bitrate|total_size|out_time_us|out_time_ms|out_time|dup_frames|drop_frames|speed|progress)=',raw_line):
+                            continue
+                        line=safe_message(raw_line,secrets)
                         if line:
-                            with self.lock: job['error']=line
+                            with self.lock:
+                                if not job.get('write_error'): job['error']=line
                             if handle:
                                 try:
                                     if handle.tell()>=2*1024*1024:
@@ -258,13 +325,26 @@ class Recorder:
             if not job: return None
             code=job['process'].poll()
             path=job['path'] if Path(job['path']).exists() else job.get('last_segment_path') or job['path']
-            return dict(running=code is None,returncode=code,duration_seconds=job['duration_seconds'],path=path,error=job['error'],has_media=job['has_media'],stopping=job['stopping'],last_progress=job['last_progress'],last_media_write_at=job['last_media_write_at'],bytes_written=job['bytes_written'],segment_count=job['segment_count'],task_id=job['task_id'],media_advancing=job['has_media'] and time.monotonic()-job['last_progress']<3,log_error=job.get('log_error',''),stop_attempts=job.get('stop_attempts',0),stop_retry_at=job.get('stop_retry_at',0),stop_retry_exhausted=job.get('stop_attempts',0)>=self.STOP_MAX_ATTEMPTS,stop_error=job.get('stop_error',''))
+            return dict(running=code is None,returncode=code,duration_seconds=job['duration_seconds'],path=path,error=job['error'],has_media=job['has_media'],stopping=job['stopping'],last_progress=job['last_progress'],last_media_write_at=job['last_media_write_at'],bytes_written=job['bytes_written'],segment_count=job['segment_count'],task_id=job['task_id'],resume=self._resume_info(job),media_advancing=job['has_media'] and time.monotonic()-job['last_progress']<3,log_error=job.get('log_error',''),stop_attempts=job.get('stop_attempts',0),stop_retry_at=job.get('stop_retry_at',0),stop_retry_exhausted=job.get('stop_attempts',0)>=self.STOP_MAX_ATTEMPTS,stop_error=job.get('stop_error',''))
     def stop(self,room_id):
         future=self.request_stop(room_id)
         return future.result() if future else None
     def request_stop(self,room_id):
         """Reserve a single reaper and return immediately to the scheduler."""
         return self._request_stop(room_id,during_close=False)
+    def request_recovery(self,room_id):
+        with self.lock:
+            job=self.jobs.get(room_id)
+            if job and job.get('pattern')=='': job['resume_pending']=True
+            return self._request_stop(room_id,during_close=False)
+    def finish_output(self,room_id,resume=None):
+        with self.lock:
+            job=self.jobs.get(room_id)
+            if job:
+                job['resume_pending']=False
+            elif resume and self.maintenance:
+                try: self.maintenance.finish_recording(resume['path'])
+                except (OSError,ValueError,sqlite3.Error): pass
     def _request_stop(self,room_id,during_close):
         with self.lock:
             job=self.jobs.get(room_id)
@@ -333,27 +413,38 @@ class Recorder:
                 try: pipe.close()
                 except (OSError,ValueError): pass
         with self.lock:
+            job['output_closed']=True
+            if job.get('pattern')=='' and job.get('has_media'):
+                # Direct MPEG-TS output has no segment-list receipt. Account
+                # for its final buffered write before persisting/releasing it.
+                self._media_progress(job,job['duration_seconds'])
+                job['segment_count']=1
             result=self.status(room_id)
+            if job.get('pattern')=='' and job.get('bytes_written',0)>=188:
+                result['has_media']=True
             result.update(running=False,stopping=True)
-            try: self._save_task(room_id,job,'stopped',force=True)
+            try: self._save_task(room_id,job,'recovering' if job.get('resume_pending') else 'stopped',force=True)
             except (OSError,ValueError,sqlite3.Error):
                 # Process/pipe reclamation must complete even on a full or
                 # temporarily unavailable task database. Existing task data
                 # remains conservative and will be rebuilt on the next run.
                 result['log_error']='录制已停止，但任务状态暂时无法保存'
                 logging.getLogger('livewatch').error('record_task_persist_failed room=%s',room_id)
-        if self.maintenance:
-            try: self.maintenance.finish_recording(job['path'])
-            except (OSError,ValueError,sqlite3.Error): pass
-            try: self.maintenance.release_log(job['log'])
-            except (OSError,ValueError,sqlite3.Error): pass
+            if self.maintenance:
+                try:
+                    if job.get('resume_pending'):
+                        self.maintenance.register_recording(job['path'],process_id=os.getpid())
+                    else: self.maintenance.finish_recording(job['path'])
+                except (OSError,ValueError,sqlite3.Error): pass
+                try: self.maintenance.release_log(job['log'])
+                except (OSError,ValueError,sqlite3.Error): pass
+            result['resume_pending']=bool(job.get('resume_pending'))
+            if self.jobs.get(room_id) is job: self.jobs.pop(room_id,None)
         if result and not result['has_media']:
             try:
                 path=Path(result['path'])
                 if path.exists() and path.stat().st_size==0: path.unlink()
             except OSError: pass
-        with self.lock:
-            if self.jobs.get(room_id) is job: self.jobs.pop(room_id,None)
         return result
     def close(self):
         with self.lock:

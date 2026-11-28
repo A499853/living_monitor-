@@ -135,7 +135,7 @@ def main(argv=None):
         from livewatch.server import LocalServer
         store = Store(root)
         engine = Engine(store)
-        engine.maintenance.reconcile_inactive()
+        engine.maintenance.reconcile_inactive(active_paths=[state['record_resume']['path'] for state in engine.states.values() if state.get('record_resume')])
         handler.register_active(engine.maintenance)
         engine.log_handler=handler
         server = LocalServer(root, store, engine, args.port)

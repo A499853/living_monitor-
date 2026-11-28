@@ -26,7 +26,8 @@ class Store:
     DEFAULTS = {'poll_interval':8,'monitor_interval_minutes':0.5,'monitor_batch_size':3,'monitor_schedule_mode':'independent','monitor_process_isolation':True,'monitor_douyin_concurrency':2,'room_check_delay_seconds':1,'status_only_mode':True,'status_poll_interval_seconds':8,'status_check_concurrency':32,'status_douyin_concurrency':32,'status_request_timeout':4,'monitor_max_requests_per_second':20,'sound_enabled':True,'ffmpeg_path':'','max_recordings':4,'douyin_cookie':'','douyin_user_agent':'','request_timeout':12,'recording_retention_days':0,'log_retention_days':0,'min_free_disk_gib':2,'record_segment_seconds':1800,'record_stall_seconds':30,'record_start_timeout_seconds':30,'douyin_access_mode':'anonymous','monitor_identity_isolation':True}
     DEFAULTS.update(status_douyin_concurrency=4, monitor_douyin_requests_per_second=2,
                     copy_source_quality='below_origin_1', copy_source_protocol='flv',
-                    playback_quality='below_origin_2', playback_protocol='hls', recording_directory='')
+                    playback_quality='below_origin_2', playback_protocol='hls', recording_directory='',
+                    record_segment_enabled=False, record_duration_enabled=False, record_duration_seconds=1800)
     def __init__(self, root):
         self.root = Path(root).resolve()
         for name in ['data','logs','video','time_begin_over']:
@@ -223,7 +224,7 @@ class Store:
                 count=value[key]
                 if isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=maximum:
                     raise ValueError(f'{label}必须为 1～{maximum} 之间的整数')
-        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,60,'高频状态请求超时'),('monitor_max_requests_per_second',1,100,'全局每秒检查上限'),('record_segment_seconds',60,86400,'录制分段时长'),('record_stall_seconds',10,300,'录制停滞期限'),('record_start_timeout_seconds',10,120,'录制启动期限')]:
+        for key,lo,hi,label in [('status_poll_interval_seconds',1,60,'高频状态检查间隔'),('status_request_timeout',2,60,'高频状态请求超时'),('monitor_max_requests_per_second',1,100,'全局每秒检查上限'),('record_segment_seconds',60,86400,'录制分段时长'),('record_duration_seconds',60,86400,'录制总时长'),('record_stall_seconds',10,300,'录制停滞期限'),('record_start_timeout_seconds',10,120,'录制启动期限')]:
             if key in value:
                 number=value[key]
                 if isinstance(number,bool) or not isinstance(number,(int,float)) or not math.isfinite(number) or not lo<=number<=hi:
@@ -241,6 +242,9 @@ class Store:
             raise ValueError('监控进程隔离设置必须为布尔值')
         if 'monitor_identity_isolation' in value and not isinstance(value['monitor_identity_isolation'],bool):
             raise ValueError('手机观看身份隔离设置必须为布尔值')
+        for key,label in [('record_segment_enabled','录制分段开关'),('record_duration_enabled','录制总时长开关')]:
+            if key in value and not isinstance(value[key],bool):
+                raise ValueError(label+'必须为布尔值')
         for key,label in [('recording_retention_days','录制保留天数'),('log_retention_days','日志保留天数')]:
             if key in value and (isinstance(value[key],bool) or not isinstance(value[key],int) or not 0<=value[key]<=3650):
                 raise ValueError(label+'必须为 0～3650 之间的整数（0 表示关闭自动清理）')
@@ -285,7 +289,7 @@ class Store:
             return json.loads(row[0]) if row else {}
     def save_record_task(self,room_id,payload):
         """One durable current task per room; never store signed URLs or headers."""
-        keys=('task_id','state','path','duration_seconds','last_media_write_at','bytes_written','segment_count','process_id','reason')
+        keys=('task_id','state','path','duration_seconds','last_media_write_at','bytes_written','segment_count','process_id','reason','resume')
         value={key:payload[key] for key in keys if key in payload}
         with self.lock,self.db:
             # A finishing worker must not recreate a task for a deleted room.

@@ -109,7 +109,10 @@ class Engine:
             self.states[rid]=dict(live_status='checking' if room['monitor_enabled'] else 'disabled',record_status='recorded' if previous.get('duration_seconds',0)>0 else 'idle',last_checked='',live_started_at=actual,observed_started_at=observed,started_at_source='' if migrated or created_time else previous.get('started_at_source',''),live_session_id=previous.get('live_session_id',''),avatar_url=previous.get('avatar_url',''),live_ended_at=previous.get('live_ended_at',''),duration_seconds=previous.get('duration_seconds',0),last_error='',resolved_stream_url='',stream_variants=[],resolved_room_input='',confirmed_live=previous.get('confirmed_live',None),retry_at=0,record_path=previous.get('record_path',''),record_headers={},source_identity=self._identity(room),source_room=dict(room),error_code='',error_diagnostic='',failure_count=0)
             self.states[rid]['platform_ended_at']=previous.get('platform_ended_at','')
             self.states[rid]['last_ended_session_id']=previous.get('last_ended_session_id','')
+            self.states[rid]['record_options']=previous.get('record_options') if room['record_enabled'] and room['monitor_enabled'] else None
+            self.states[rid]['record_deadline_at']=previous.get('record_deadline_at',0) if room['record_enabled'] and room['monitor_enabled'] else 0
             task=self.store.get_record_task(rid) if hasattr(self.store,'get_record_task') else {}
+            self.states[rid]['record_resume']=task.get('resume') if self.states[rid]['record_options'] else None
             self.states[rid].update(last_media_at=task.get('last_media_write_at') or previous.get('last_media_at',''),
                                     record_task_id=task.get('task_id') or previous.get('record_task_id',''),
                                     record_recovery_count=previous.get('record_recovery_count',0),
@@ -158,7 +161,9 @@ class Engine:
             try:
                 handler=getattr(self,'log_handler',None)
                 if handler: handler.drain_maintenance(self.maintenance)
-                result=self.maintenance.cleanup()
+                with self.lock:
+                    protected=[state['record_resume']['path'] for state in self.states.values() if state.get('record_options') and state.get('record_resume')]
+                result=self.maintenance.cleanup(protected_paths=protected)
                 self.maintenance_status['last_cleanup']=dict(result,checked_at=now_iso())
                 if result.get('deleted'):
                     self.store.append_event('files_cleaned',None,'按保留设置清理 '+str(result['recordings_deleted'])+' 个录制文件、'+str(result['logs_deleted'])+' 个日志文件')
@@ -979,6 +984,7 @@ class Engine:
         payload['platform_ended_at']=state.get('platform_ended_at','')
         payload['last_ended_session_id']=state.get('last_ended_session_id','')
         payload.update({key:state.get(key) for key in ('last_media_at','record_task_id','record_recovery_count')})
+        payload.update(record_options=state.get('record_options'),record_deadline_at=state.get('record_deadline_at',0))
         now=time.monotonic()
         # Persist freshness on a state change, a minute checkpoint, or graceful
         # exit. Thirty status reads per second need not become thirty commits.
@@ -1184,18 +1190,21 @@ class Engine:
             except (RuntimeError,ImportError): pass
     def _start_record(self,room,state):
         rid=room['id']; settings=self.store.get_settings()
+        if state.get('_record_limit_reached') or self._expire_record_limit(room,state): return
         if rid in self.record_stop_tasks: return
         status=self.recorder.status(rid)
         selection=(room.get('record_quality',''),room.get('record_protocol',''),room.get('record_directory') or settings.get('recording_directory',''))
         if status and status['running']:
             if selection!=state.get('_record_selection',selection):
+                state['_record_new_output']=True
                 self._queue_record_stop(rid,room,report_saved=True)
+                state['record_resume']=None
                 state.update(record_status='recovering',record_needs_source=True,record_recheck_at=time.monotonic(),retry_at=0)
                 self.store.append_event('record_source_changed',room,'录制画质、格式或目录已更改，重新取源后创建新片段')
             return
         if state.get('record_needs_source'): return
         if time.monotonic()<state['retry_at']: return
-        disk=self.maintenance.disk_status(settings,room=room)
+        disk=self.maintenance.disk_status(settings,room=room,path=(state.get('record_resume') or {}).get('path'))
         self.maintenance_status['disk']=disk
         if not disk['recording_allowed']:
             state['record_status']='queued'; state['last_error']=disk['error'] or '磁盘剩余空间低于保护阈值，已暂停录制；监控继续'
@@ -1234,9 +1243,22 @@ class Engine:
                 state['record_status']='starting'
                 return
         try:
+            # Keep the mode and original deadline across source recovery and
+            # application restarts. Global mode edits apply to the next run.
+            options=state.get('record_options') or {key:settings.get(key,default) for key,default in (
+                ('record_segment_enabled',False),('record_segment_seconds',1800),
+                ('record_duration_enabled',False),('record_duration_seconds',1800))}
+            settings=dict(settings,**options)
+            if state.get('record_resume'): settings['_record_resume']=dict(state['record_resume'])
             self.recorder.start(room,source,state['record_headers'],settings)
             status=self.recorder.status(rid) or {}
-            state.update(record_status='starting',duration_seconds=0,record_path=status.get('path',''),record_started=time.monotonic(),last_error='',record_task_id=status.get('task_id',''),_record_selection=selection)
+            state.update(record_status='starting',duration_seconds=status.get('duration_seconds',0),record_path=status.get('path',''),record_started=time.monotonic(),last_error='',record_task_id=status.get('task_id',''),_record_selection=selection)
+            state['record_options']=options
+            state.pop('_record_new_output',None)
+            self._record_metrics(state,status)
+            if options['record_duration_enabled'] and not state.get('record_deadline_at'):
+                state['record_deadline_at']=time.time()+options['record_duration_seconds']
+            self._persist(rid,state)
             self.store.append_event('record_started',room,'启动后台录制，等待有效媒体写入')
         except (OSError,ValueError) as exc: self._record_failure(room,state,safe_message(exc))
     def _record_failure(self,room,state,message):
@@ -1252,13 +1274,28 @@ class Engine:
         self._save_record_state(room['id'],state,'recovering')
     def _save_record_state(self,rid,state,phase):
         if hasattr(self.store,'save_record_task'):
-            self.store.save_record_task(rid,dict(task_id=state.get('record_task_id',''),state=phase,path=state.get('record_path',''),duration_seconds=state.get('duration_seconds',0),last_media_write_at=state.get('last_media_at',''),bytes_written=state.get('record_bytes_written',0),segment_count=state.get('record_segment_count',0)))
+            self.store.save_record_task(rid,dict(task_id=state.get('record_task_id',''),state=phase,path=state.get('record_path',''),duration_seconds=state.get('duration_seconds',0),last_media_write_at=state.get('last_media_at',''),bytes_written=state.get('record_bytes_written',0),segment_count=state.get('record_segment_count',0),resume=state.get('record_resume')))
     def _record_metrics(self,state,status):
         for key,value in [('last_media_at',status.get('last_media_write_at')),('record_task_id',status.get('task_id'))]:
             if value: state[key]=value
         state['record_bytes_written']=status.get('bytes_written',state.get('record_bytes_written',0))
         state['record_segment_count']=status.get('segment_count',state.get('record_segment_count',0))
+        if status.get('resume') and state.get('record_options') and not state.get('_record_new_output'):
+            state['record_resume']=status['resume']
+    def _expire_record_limit(self,room,state):
+        deadline=state.get('record_deadline_at',0)
+        if not deadline or time.time()<deadline: return False
+        if room['record_enabled']:
+            # Persist the switch before stopping so a late probe or restart
+            # cannot immediately start another recording of the same stream.
+            self.store.update_room(room['id'],dict(record_enabled=False))
+            room['record_enabled']=False
+            state['_record_limit_reached']=True
+            self.store.append_event('record_duration_reached',room,'已达到指定录制时长，自动关闭本房录制；监控继续')
+        self._stop_record(room['id'],room)
+        return True
     def _inspect_record(self,room,state):
+        if self._expire_record_limit(room,state): return
         if room['id'] in self.record_stop_tasks: return
         status=self.recorder.status(room['id'])
         if not status: return
@@ -1269,42 +1306,49 @@ class Engine:
             settings=self.store.get_settings()
             disk=self.maintenance.disk_status(settings,path=status.get('path'))
             if not disk['recording_allowed']:
-                self._queue_record_stop(room['id'],room,report_saved=True)
+                self._queue_record_stop(room['id'],room,report_saved=True,recover=True)
                 state['last_error']=disk['error'] or '磁盘剩余空间低于保护阈值，已暂停录制；监控继续'
                 state['retry_at']=time.monotonic()+5
                 return
             if status.get('has_media') and state['record_status']!='recording':
                 state['record_status']='recording'
-                if state.get('record_recovery_count',0): self.store.append_event('record_recovered',room,'已重新取得直播源，新片段正在持续写入有效媒体')
+                if state.get('record_recovery_count',0): self.store.append_event('record_recovered',room,'已重新取得直播源，正在继续写入原录像文件' if not settings.get('record_segment_enabled') else '已重新取得直播源，继续分段录制')
             if status.get('has_media') and status.get('duration_seconds',0)>=30:
                 state['record_failure_count']=0
             settings=self.store.get_settings()
             startup_timeout=settings.get('record_start_timeout_seconds',30)
             stall_timeout=settings.get('record_stall_seconds',30)
             if not status.get('has_media') and time.monotonic()-state.get('record_started',time.monotonic())>startup_timeout:
-                self._queue_record_stop(room['id'],room)
+                self._queue_record_stop(room['id'],room,recover=True)
                 self._record_failure(room,state,f'录制进程 {startup_timeout:g} 秒未产生有效媒体，正在重新取源')
             elif status.get('has_media') and time.monotonic()-status.get('last_progress',time.monotonic())>stall_timeout:
-                self._queue_record_stop(room['id'],room)
+                self._queue_record_stop(room['id'],room,recover=True)
                 self._record_failure(room,state,f'直播源 {stall_timeout:g} 秒无有效媒体写入，正在关闭连接并重新取源')
             return
         # A running broadcast can disconnect without the provider observing offline.
-        self._queue_record_stop(room['id'],room)
+        self._queue_record_stop(room['id'],room,recover=True)
         if not self.stop_event.is_set(): self._record_failure(room,state,'直播源连接结束，等待重新解析重试。'+status.get('error',''))
     def _stop_record(self,rid,room):
         if rid in self.states:
             state=self.states[rid]
+            finish_output=getattr(self.recorder,'finish_output',None)
+            if finish_output: finish_output(rid,state.get('record_resume'))
+            had_options=bool(state.get('record_options') or state.get('record_deadline_at'))
+            state.update(record_options=None,record_deadline_at=0,record_resume=None)
+            state.pop('_record_new_output',None)
             state.pop('record_recheck_at',None)
             state.pop('record_needs_source',None)
             if state['record_status'] in ('recovering','failed','queued','starting'):
                 state['record_status']='stopped' if room and (not room.get('record_enabled') or not room.get('monitor_enabled')) else 'completed' if state.get('duration_seconds',0)>0 else 'idle'
                 self._save_record_state(rid,state,state['record_status'])
+            if had_options: self._persist(rid,state)
         self._queue_record_stop(rid,room,report_saved=True)
-    def _queue_record_stop(self,rid,room,report_saved=False):
+    def _queue_record_stop(self,rid,room,report_saved=False,recover=False):
         if rid in self.record_stop_tasks: return
         status=self.recorder.status(rid)
         if not status: return
-        request_stop=getattr(self.recorder,'request_stop',None)
+        request_stop=getattr(self.recorder,'request_recovery',None) if recover else None
+        request_stop=request_stop or getattr(self.recorder,'request_stop',None)
         if request_stop:
             future=request_stop(rid)
             if future:
@@ -1364,6 +1408,7 @@ class Engine:
             for room in rooms:
                 is_new=room['id'] not in self.states
                 state=self._state(room)
+                if room['record_enabled']: state.pop('_record_limit_reached',None)
                 was_disabled=state['live_status']=='disabled'
                 identity=self._identity(room)
                 changed=state['source_identity']!=identity
